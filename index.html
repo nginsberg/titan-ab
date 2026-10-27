@@ -1,0 +1,533 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Titan A/B drill</title>
+<style>
+  :root { --bg:#0e1116; --card:#171c24; --card2:#1e2530; --fg:#e8edf3; --mut:#8b97a7; --acc:#3b9cff; --ok:#2fbf71; --warn:#f0b429; --bad:#e5484d; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.4 -apple-system, system-ui, Helvetica, Arial, sans-serif; overflow-x:hidden; }
+  body { padding:12px 16px 130px; max-width:640px; margin:0 auto; }
+  h1 { font-size:20px; margin:4px 0 10px; }
+  h2 { font-size:16px; margin:0 0 8px; }
+  .card { background:var(--card); border-radius:12px; padding:12px; margin:0 0 12px; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .grow { flex:1; }
+  button { font:inherit; color:var(--fg); background:var(--card2); border:1px solid #2c3644; border-radius:10px; min-height:48px; padding:0 16px; }
+  button.primary { background:var(--acc); border-color:var(--acc); color:#04121f; font-weight:600; }
+  button.go { background:var(--ok); border-color:var(--ok); color:#03170c; font-weight:700; width:100%; min-height:56px; font-size:18px; }
+  button:disabled { opacity:.45; }
+  input[type=number], input[type=text], input[type=password] { font:inherit; color:var(--fg); background:#0e1116; border:1px solid #2c3644; border-radius:8px; min-height:44px; padding:0 10px; width:100%; }
+  label.tog { display:flex; align-items:center; gap:8px; min-height:44px; }
+  input[type=checkbox] { width:22px; height:22px; }
+  .chip { display:inline-block; padding:4px 10px; border-radius:999px; background:var(--card2); font-size:14px; }
+  .chip.ok { background:#12331f; color:#7be3a6; } .chip.bad { background:#3d1417; color:#ff9a9d; } .chip.warn { background:#3a2e0b; color:#f7d070; }
+  .mut { color:var(--mut); font-size:14px; }
+  .shot { background:var(--card2); border-radius:10px; padding:8px 10px; margin:8px 0; }
+  .shot h3 { font-size:15px; margin:0 0 2px; }
+  .sl { display:grid; grid-template-columns:62px 1fr; column-gap:8px; align-items:center; margin:2px 0; }
+  .sl .nm { font-size:14px; color:var(--mut); }
+  .sl .val { font-size:14px; }
+  .sl .val b { display:inline-block; min-width:26px; }
+  .sl input[type=range] { grid-column:1 / 3; width:100%; height:34px; margin:0; accent-color:var(--acc); }
+  details > summary { min-height:44px; display:flex; align-items:center; font-weight:600; cursor:pointer; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .grid2 label { font-size:14px; color:var(--mut); display:block; }
+  pre#log { margin:0; max-height:300px; overflow:auto; white-space:pre-wrap; word-break:break-all; font:12px/1.35 ui-monospace, Menlo, monospace; background:#0a0d12; padding:8px; border-radius:8px; }
+  #steps div { padding:3px 0; font-size:14px; word-break:break-word; } #steps .ok { color:#7be3a6; } #steps .err { color:#ff9a9d; }
+  #stopbar { position:fixed; left:0; right:0; bottom:0; padding:8px 16px calc(8px + env(safe-area-inset-bottom)); background:linear-gradient(transparent, var(--bg) 25%); }
+  #stopbar .in { max-width:640px; margin:0 auto; display:flex; gap:8px; }
+  #btnStop { flex:1; min-height:84px; font-size:34px; font-weight:800; letter-spacing:2px; background:var(--bad); border-color:#ff7377; color:#fff; }
+  #btnPause { width:96px; min-height:84px; }
+  #banner { display:none; background:var(--bad); color:#fff; border-radius:10px; padding:10px 12px; margin:0 0 12px; font-weight:600; }
+</style>
+</head>
+<body>
+<h1>Titan A/B drill</h1>
+<div id="banner"></div>
+
+<div class="card">
+  <div class="row">
+    <button id="btnConnect" class="primary grow">Connect</button>
+    <label class="tog"><input type="checkbox" id="dry"> Dry run</label>
+  </div>
+  <div class="row" style="margin-top:6px">
+    <span id="connChip" class="chip">not connected</span>
+    <span id="verChip" class="chip">version ?</span>
+    <span id="statChip" class="chip">status ?</span>
+  </div>
+  <label class="tog mut"><input type="checkbox" id="scanAll"> Scan all devices (use if the machine is not listed)</label>
+  <div id="noBt" class="mut" style="display:none">This browser has no Web Bluetooth. Dry run only. Open the page in Bluefy on iPhone.</div>
+</div>
+
+<div class="card" id="pinCard">
+  <h2>Machine PIN</h2>
+  <div class="mut" id="pinHelp">If the machine asks for a code, enter the 6-digit code shown on its screen.</div>
+  <div class="row" style="margin-top:6px">
+    <input type="text" id="pin" inputmode="numeric" maxlength="6" placeholder="6 digits" autocomplete="off" style="width:140px">
+    <button id="btnPin">Send PIN</button>
+    <span id="pinChip" class="chip">not sent</span>
+  </div>
+</div>
+
+<div class="card"><h2>Group A</h2><div id="edA"></div></div>
+<div class="card"><h2>Group B</h2><div id="edB"></div></div>
+<div class="row" style="margin:0 0 12px"><button id="btnReset">Reset shots to defaults</button></div>
+
+<div class="card">
+  <details id="settings">
+    <summary>On-court test settings</summary>
+    <div class="grid2" style="margin-top:6px">
+      <div><label for="slot">Drill slot (1-24)</label><input type="number" id="slot" min="1" max="24" inputmode="numeric"></div>
+      <div><label for="pairs">Pairs per drill (1-8)</label><input type="number" id="pairs" min="1" max="8" inputmode="numeric"></div>
+      <div><label for="repeat">Repeat count (Mega Drill)</label><input type="number" id="repeat" min="1" max="99" inputmode="numeric"></div>
+      <div><label for="pos">Machine position (0-3)</label><input type="number" id="pos" min="0" max="3" inputmode="numeric"></div>
+    </div>
+    <div id="pairsNote" class="mut" style="margin-top:6px">Each pair = one Random ball from A, then one from B. The official app allows at most 5 random balls per drill, so more than 2 pairs may be rejected by the machine.</div>
+    <div class="mut" style="margin-top:6px">The drill slot is overwritten on the machine each time you press Start; slot 24 replaces whatever drill is saved there.</div>
+    <div class="mut" style="margin-top:6px">Repeat sends the slot number N times in Set Current Drill (Mega Drill). 1 sends it once.</div>
+  </details>
+</div>
+
+<div class="card">
+  <button id="btnStart" class="go">Start drill</button>
+  <div id="steps" style="margin-top:8px"></div>
+</div>
+
+<div class="card">
+  <details id="logbox">
+    <summary>Log</summary>
+    <div class="row" style="margin:6px 0"><button id="btnCopy">Copy log</button><button id="btnClear">Clear</button><span id="copyMsg" class="mut"></span></div>
+    <pre id="log"></pre>
+  </details>
+</div>
+
+<div id="stopbar"><div class="in"><button id="btnPause">Pause</button><button id="btnStop">STOP</button></div></div>
+
+<script src="protocol.js"></script>
+<script>
+(function () {
+  'use strict';
+  var P = window.TitanProtocol;
+  var NUS = '6e400001-b5a3-f393-e0a9-e50e24dcca9e', NUS_WRITE = '6e400002-b5a3-f393-e0a9-e50e24dcca9e', NUS_NOTIFY = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+  var $ = function (id) { return document.getElementById(id); };
+
+  // ---------- state ----------
+  // Defaults from the app's pickleball preset table (common/distance_height_data_manager.dart, machine position 0).
+  // Group A: speed-9 row (cells 10/12/14, fastest = deepest). Group B: speed-5 row (cells 1/2/3, short). Spin 10 = none.
+  function defaults() {
+    return {
+      A: [{horz:4,speed:9,spin:10,height:20,feed:5}, {horz:10,speed:9,spin:10,height:20,feed:5}, {horz:16,speed:9,spin:10,height:20,feed:5}],
+      B: [{horz:6,speed:5,spin:10,height:26,feed:5}, {horz:10,speed:5,spin:10,height:23,feed:5}, {horz:14,speed:5,spin:10,height:26,feed:5}],
+      cfg: {slot:24, pairs:2, repeat:10, pos:0}
+    };
+  }
+  var S = defaults();
+  var KEY = 'titanab.v1', PINKEY = 'titanab.pin';
+  // A stored shot is used only if every field is a number inside its allowed range; otherwise the whole shot
+  // resets to its default (a corrupt value is never clamped into something plausible).
+  function sane(shot, def) {
+    var out = {};
+    for (var i = 0; i < P.FIELDS.length; i++) {
+      var f = P.FIELDS[i], v = shot && shot[f];
+      if (typeof v !== 'number' || !isFinite(v) || v !== Math.round(v) || v < P.RANGES[f][0] || v > P.RANGES[f][1]) return Object.assign({}, def);
+      out[f] = v;
+    }
+    return out;
+  }
+  function load() {
+    try {
+      var j = JSON.parse(localStorage.getItem(KEY) || 'null');
+      if (j && j.A && j.B && j.A.length === 3 && j.B.length === 3) {
+        var d = defaults();
+        S.A = j.A.map(function (sh, i) { return sane(sh, d.A[i]); });
+        S.B = j.B.map(function (sh, i) { return sane(sh, d.B[i]); });
+        if (j.cfg) Object.keys(S.cfg).forEach(function (k) { if (typeof j.cfg[k] === 'number') S.cfg[k] = j.cfg[k]; });
+      }
+    } catch (e) {}
+  }
+  function save() { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {} }
+
+  var dry = false, connected = false, device = null, chW = null, chN = null;
+  var seq = 0; // bumped by STOP / PAUSE / disconnect so a running start sequence aborts
+  var sequenceRunning = false;
+  var WRITE_TIMEOUT = 1000;   // ms; one GATT write that takes longer is treated as failed
+  var txGen = 0, txWhy = 'a newer STOP/PAUSE/disconnect';   // transmit generation: bumped on cancel so chained writes that have not started are dropped
+  var headSince = 0;          // when the write currently at the head of the chain started (0 = none)
+
+  // ---------- log ----------
+  var logLines = [];
+  function ts() { var d = new Date(); var p = function (n, w) { return String(n).padStart(w || 2, '0'); }; return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds()) + '.' + p(d.getMilliseconds(), 3); }
+  function log(dir, msg) {
+    var line = ts() + ' ' + dir + ' ' + msg;
+    logLines.push(line); if (logLines.length > 4000) logLines.splice(0, 500);
+    var pre = $('log'); pre.textContent = logLines.join('\n'); if ($('logbox').open) pre.scrollTop = pre.scrollHeight;
+  }
+
+  // ---------- transport: one request at a time ----------
+  var queue = [], running = false, waiters = [], writeChain = Promise.resolve();
+
+  // STOP/PAUSE go to the wire even if Dry run is ticked, as long as we are connected.
+  function isDry(wire) { return dry && !(wire && connected); }
+  function cancelErr(why) { var e = new Error('cancelled by ' + why); e.cancelled = true; return e; }
+  // Drop everything queued and abandon everything waiting for a reply; also aborts a running start sequence.
+  function cancelAll(why) {
+    seq++; txGen++; txWhy = why;
+    var dropped = queue.splice(0); dropped.forEach(function (t) { t.reject(cancelErr(why)); });
+    var old = waiters.splice(0); old.forEach(function (w) { clearTimeout(w.timer); w.reject(cancelErr(why)); });
+    return { dropped: dropped.length, waiting: old.length };
+  }
+
+  function onNotify(bytes) {
+    log('RX', 'chunk ' + P.hex(bytes));
+    parser.feed(bytes);
+  }
+  var parser = new P.FrameParser(function (f) {
+    log('RX', 'frame func=0x' + f.func.toString(16) + ' len=' + f.payload.length + ' payload=[' + P.hex(f.payload) + '] ' + (f.noCrc ? 'no crc (zero-length)' : f.crcOk ? 'crc ok' : 'CRC BAD'));
+    for (var i = 0; i < waiters.length; i++) {
+      if (waiters[i].func === f.func) { var w = waiters.splice(i, 1)[0]; clearTimeout(w.timer); w.resolve(f); return; }
+    }
+    log('RX', 'unexpected frame (nothing waiting for func 0x' + f.func.toString(16) + ')');
+  });
+
+  // One GATT write, failing if the browser does not answer within WRITE_TIMEOUT.
+  function gattWrite(part) {
+    var w = chW;
+    return new Promise(function (resolve, reject) {
+      var to = setTimeout(function () { var e = new Error('GATT write timed out (' + WRITE_TIMEOUT + ' ms)'); e.writeTimeout = true; reject(e); }, WRITE_TIMEOUT);
+      var op;
+      try { op = w.writeValueWithResponse ? w.writeValueWithResponse(part) : w.writeValue(part); } catch (e) { clearTimeout(to); return reject(e); }
+      Promise.resolve(op).then(function (v) { clearTimeout(to); resolve(v); }, function (e) { clearTimeout(to); reject(e); });
+    });
+  }
+  // gen: if given, the write is abandoned (before any further chunk) once txGen has moved on, so a frame queued behind a
+  // slow write can never reach the machine after STOP/PAUSE, and a half-written frame stops after its current chunk.
+  async function writeParts(parts, maxTries, track, gen) {
+    for (var i = 0; i < parts.length; i++) {
+      var tries = 0;
+      for (;;) {
+        var mine = 0;
+        try {
+          if (gen !== undefined && gen !== txGen) throw cancelErr(txWhy);
+          if (!connected || !chW) throw new Error('not connected');
+          if (track) headSince = mine = Date.now();
+          await gattWrite(parts[i]);
+          if (track && headSince === mine) headSince = 0;
+          break;
+        } catch (e) {
+          if (track && headSince === mine) headSince = 0;
+          if (e.cancelled || e.writeTimeout || ++tries >= maxTries || !connected) throw e;   // never retry a timed-out write
+          await new Promise(function (r) { setTimeout(r, 80); });
+        }
+      }
+    }
+  }
+  // opts: wire (send even in dry run if connected), direct (bypass the write chain; used by STOP when the chain looks stuck), urgent (STOP)
+  function writeFrame(frame, name, opts) {
+    opts = opts || {};
+    var parts = P.chunk(frame), d = isDry(opts.wire);
+    log('TX', name + (d ? ' [dry]' : '') + ' ' + P.hex(frame) + '  (' + frame.length + ' B, ' + parts.length + ' write' + (parts.length > 1 ? 's' : '') + ')');
+    if (d) return Promise.resolve();
+    if (opts.direct) return writeParts(parts, 5, false);
+    var gen = opts.urgent ? undefined : txGen;   // STOP is urgent: never dropped by a later cancel
+    var p = writeChain.then(function () { return writeParts(parts, 3, true, gen); });
+    writeChain = p.catch(function () {});
+    return p;
+  }
+
+  function exchange(t) {
+    if (isDry(t.wire)) {
+      writeFrame(t.frame, t.name, { wire: t.wire });
+      if (t.onWritten) t.onWritten();
+      return Promise.resolve({ func: t.func, payload: [], raw: [], crcOk: true, dry: true });
+    }
+    return new Promise(function (resolve, reject) {
+      var w = { func: t.func, resolve: resolve, reject: reject };
+      w.timer = setTimeout(function () {
+        waiters = waiters.filter(function (x) { return x !== w; });
+        reject(new Error('no reply to ' + t.name + ' within ' + t.timeout + ' ms'));
+      }, t.timeout);
+      waiters.push(w);
+      writeFrame(t.frame, t.name, { wire: t.wire }).then(function () { if (t.onWritten) t.onWritten(); }, function (e) {
+        clearTimeout(w.timer); waiters = waiters.filter(function (x) { return x !== w; }); reject(e);
+      });
+    });
+  }
+  async function pump() {
+    if (running) return; running = true;
+    while (queue.length) {
+      var t = queue.shift();
+      try { t.resolve(await exchange(t)); } catch (e) { t.reject(e); }
+    }
+    running = false;
+  }
+  // opts: timeout (ms), front (jump the queue), wire (see isDry), onWritten (called once the frame is written)
+  function request(name, func, frame, opts) {
+    opts = opts || {};
+    return new Promise(function (resolve, reject) {
+      if (!isDry(opts.wire) && !connected) return reject(new Error('not connected'));
+      var t = { name: name, func: func, frame: frame, timeout: opts.timeout || 2000, wire: opts.wire, onWritten: opts.onWritten, resolve: resolve, reject: reject };
+      if (opts.front) queue.unshift(t); else queue.push(t);
+      pump();
+    });
+  }
+  function checked(resp, name) {
+    if (!resp.crcOk && !resp.dry) throw new Error(name + ': reply failed the CRC check');
+    return resp;
+  }
+
+  // ---------- connection ----------
+  function setConn(text, cls) { var c = $('connChip'); c.textContent = text; c.className = 'chip ' + (cls || ''); }
+  function banner(msg) { var b = $('banner'); b.textContent = msg || ''; b.style.display = msg ? 'block' : 'none'; }
+
+  function onGattNotify(e) { var v = e.target.value; onNotify(new Uint8Array(v.buffer, v.byteOffset, v.byteLength)); }
+  function resetTransport(why) {
+    connected = false; chW = null; chN = null;
+    queue.splice(0).forEach(function (t) { t.reject(new Error(why)); });
+    waiters.splice(0).forEach(function (w) { clearTimeout(w.timer); w.reject(new Error(why)); });
+    writeChain = Promise.resolve(); headSince = 0;
+    seq++; txGen++; txWhy = why;
+  }
+  // Drop the previous connection and its listeners (same device/characteristic objects can come back on reconnect).
+  function teardown() {
+    if (chN) { try { chN.removeEventListener('characteristicvaluechanged', onGattNotify); } catch (e) {} }
+    if (device) {
+      try { device.removeEventListener('gattserverdisconnected', onDisconnected); } catch (e) {}
+      try { if (device.gatt && device.gatt.connected) device.gatt.disconnect(); } catch (e) {}
+    }
+    resetTransport('reconnecting');
+  }
+
+  async function connect() {
+    if (!navigator.bluetooth) { banner('This browser has no Web Bluetooth. Use Dry run, or open the page in Bluefy.'); return; }
+    banner(''); writeChain = Promise.resolve(); headSince = 0;
+    try {
+      var opts = $('scanAll').checked ? { acceptAllDevices: true, optionalServices: [NUS] } : { filters: [{ services: [NUS] }], optionalServices: [NUS] };
+      setConn('choosing device...', 'warn');
+      var picked = await navigator.bluetooth.requestDevice(opts);
+      teardown();
+      device = picked;
+      // Real connection from here on: Dry run only ever affects Start, so it is switched off and locked while connected.
+      dry = false; $('dry').checked = false; $('dry').disabled = true;
+      device.addEventListener('gattserverdisconnected', onDisconnected);
+      log('--', 'device ' + (device.name || device.id));
+      setConn('connecting...', 'warn');
+      var server = await device.gatt.connect();
+      var svc = await server.getPrimaryService(NUS);
+      chW = await svc.getCharacteristic(NUS_WRITE);
+      chN = await svc.getCharacteristic(NUS_NOTIFY);
+      chN.removeEventListener('characteristicvaluechanged', onGattNotify);
+      chN.addEventListener('characteristicvaluechanged', onGattNotify);
+      await chN.startNotifications();
+      connected = true; parser.reset();
+      setConn('connected: ' + (device.name || 'device'), 'ok');
+      $('btnConnect').textContent = 'Reconnect';
+      await afterConnect();
+    } catch (e) {
+      if (!connected) $('dry').disabled = false;
+      setConn(connected ? 'connected: ' + ((device && device.name) || 'device') : 'connect failed', connected ? 'ok' : 'bad');
+      banner('Connect failed: ' + (e && e.message || e)); log('ERR', 'connect: ' + (e && e.message || e));
+    }
+  }
+  function onDisconnected() {
+    resetTransport('disconnected');
+    $('dry').disabled = false; $('btnConnect').disabled = !navigator.bluetooth;
+    setConn('DISCONNECTED', 'bad'); $('statChip').textContent = 'status ?'; $('statChip').className = 'chip';
+    banner('Bluetooth DISCONNECTED. The machine may still be running. Press the machine stop, then Reconnect.');
+    log('--', 'gattserverdisconnected');
+  }
+
+  async function afterConnect() {
+    try {
+      var r = checked(await request('GetVersion', P.FUNC.VERSION, P.requests.getVersion()), 'GetVersion');
+      var v = P.parseVersion(r.raw);
+      $('verChip').textContent = 'version ' + v.text.trim(); $('verChip').className = 'chip ok';
+      log('--', 'version text="' + v.text + '" major=' + v.major + ' minor=' + v.minor + ' mode=' + v.mode + ' (' + v.modeName + ') needsPin=' + v.needsPin);
+      if (v.needsPin) {
+        var stored = ''; try { stored = localStorage.getItem(PINKEY) || ''; } catch (e) {}
+        await verify(0, stored);
+      } else {
+        $('pinChip').textContent = 'not required (by version/mode)';
+      }
+    } catch (e) {
+      $('verChip').textContent = 'version: no reply'; $('verChip').className = 'chip bad';
+      banner('Connected, but GetVersion failed: ' + e.message); log('ERR', 'afterConnect: ' + e.message);
+    }
+  }
+
+  // kind 0 = automatic (stored code or none), 1 = typed by the user
+  async function verify(kind, code) {
+    var c = $('pinChip');
+    try {
+      var r = checked(await request('VerifyCode', P.FUNC.VERIFY, P.requests.verify(kind, code)), 'VerifyCode');
+      var res = r.dry ? 'ok' : P.parseVerify(r);
+      if (res === 'ok') { c.textContent = 'PIN ok'; c.className = 'chip ok'; if (code) try { localStorage.setItem(PINKEY, code); } catch (e) {} }
+      else if (res === 'needPin') { c.textContent = 'PIN needed'; c.className = 'chip warn'; $('pinCard').scrollIntoView({ block: 'center' }); banner('Machine wants a PIN: enter the 6-digit code from its screen.'); }
+      else { c.textContent = 'PIN wrong'; c.className = 'chip bad'; }
+      return res;
+    } catch (e) { c.textContent = 'PIN: ' + e.message; c.className = 'chip bad'; return 'error'; }
+  }
+
+  // ---------- status polling ----------
+  var pollBusy = false, misses = 0;
+  setInterval(async function () {
+    if (dry || !connected || pollBusy || sequenceRunning || queue.length > 1) return;
+    pollBusy = true;
+    try {
+      var r = checked(await request('GetRobotStatus', P.FUNC.STATUS, P.requests.getStatus(), { timeout: 1500 }), 'status');
+      var s = P.parseStatus(r); misses = 0;
+      // A reconnect would tear the link down mid-drill, so Connect is locked while the machine is running.
+      $('btnConnect').disabled = !navigator.bluetooth || ['START', 'PENDING_START', 'MOTO_STARTING', 'TESTING'].indexOf(s.name) >= 0;
+      var c = $('statChip'); c.textContent = 'status ' + s.name; c.className = 'chip ' + (s.name === 'START' ? 'ok' : s.name === 'ALARM' ? 'bad' : '');
+    } catch (e) {
+      // A half-dead link must not keep Reconnect locked: the user may need it to send STOP.
+      if (++misses >= 3 && connected) { $('statChip').textContent = 'status: no reply'; $('statChip').className = 'chip warn'; $('btnConnect').disabled = !navigator.bluetooth; }
+    } finally { pollBusy = false; }
+  }, 1000);
+
+  // ---------- actions ----------
+  function steps(msg, cls) { var d = document.createElement('div'); d.textContent = msg; if (cls) d.className = cls; $('steps').appendChild(d); }
+  function readCfg() {
+    var g = function (id, lo, hi, def) { var n = parseInt($(id).value, 10); if (isNaN(n)) n = def; return Math.min(hi, Math.max(lo, n)); };
+    var pos = parseInt($('pos').value, 10); if (isNaN(pos) || pos < 0 || pos > 3) pos = 0;   // out of range -> 0, not clamped
+    S.cfg = { slot: g('slot', 1, 24, 24), pairs: g('pairs', 1, 8, 2), repeat: g('repeat', 1, 99, 10), pos: pos };
+    ['slot', 'pairs', 'repeat', 'pos'].forEach(function (k) { $(k).value = S.cfg[k]; });
+    $('pairsNote').style.color = S.cfg.pairs > 2 ? 'var(--warn)' : '';
+    save();
+  }
+
+  async function startDrill() {
+    readCfg();
+    if (!dry && !connected) { banner('Not connected. Connect first, or turn on Dry run.'); return; }
+    if (!window.confirm('Machine will start firing. Stand clear.')) return;
+    banner(''); $('steps').textContent = '';
+    var my = ++seq, c = S.cfg, startWritten = false, i = 0;
+    var drill = { number: c.slot, name: 'AB RANDOM', machinePos: c.pos, shuffle: false, balls: P.abBalls(S.A.map(P.clampShot), S.B.map(P.clampShot), c.pairs) };
+    var plan = [
+      ['SaveDrill', P.FUNC.SAVE_DRILL, P.requests.saveDrill(drill), 3500, null],
+      ['SetCurrentDrill x' + c.repeat, P.FUNC.SET_CURRENT, P.requests.setCurrent(P.repeatSlots(c.slot, c.repeat)), 2000, null],
+      ['Control START', P.FUNC.CONTROL, P.requests.control('START'), 2000, function () { startWritten = true; }]
+    ];
+    var SENT = 'START was sent; the machine may be running. Press STOP.';
+    $('btnStart').disabled = true; sequenceRunning = true;
+    try {
+      for (i = 0; i < plan.length; i++) {
+        if (seq !== my) { steps('Sequence cancelled.', 'err'); return; }
+        var p = plan[i];
+        steps((i + 1) + '. ' + p[0] + ' ...');
+        var r = checked(await request(p[0], p[1], p[2], { timeout: p[3], onWritten: p[4] }), p[0]);
+        if (seq !== my) { steps('Sequence cancelled.' + (startWritten ? ' ' + SENT : ''), 'err'); return; }
+        steps((i + 1) + '. ' + p[0] + ': ' + (r.dry ? 'dry run, not sent' : 'reply payload [' + P.hex(r.payload) + ']'), 'ok');
+      }
+      steps(dry ? 'Dry run done: frames are in the log, nothing was sent.' : 'Done. Machine should be running. Watch the status chip.', 'ok');
+    } catch (e) {
+      log('ERR', 'start: ' + e.message);
+      if (e.cancelled) {
+        steps('Sequence ' + e.message + '.' + (startWritten ? ' ' + SENT : ''), 'err');
+      } else if (startWritten || (i === 2 && e.writeTimeout)) {
+        steps(SENT + ' (' + e.message + ')', 'err'); banner(SENT + ' (' + e.message + ')');
+      } else {
+        steps('STOPPED: ' + e.message, 'err'); banner('Start sequence failed: ' + e.message);
+      }
+    } finally { sequenceRunning = false; $('btnStart').disabled = false; }
+  }
+
+  // Resolves with the next frame of this func, or null after ms; cancel() abandons the wait.
+  function expectReply(func, ms) {
+    var w = { func: func }, done;
+    var promise = new Promise(function (resolve) {
+      done = resolve; w.resolve = resolve; w.reject = function () { resolve(null); };
+      w.timer = setTimeout(function () { waiters = waiters.filter(function (x) { return x !== w; }); resolve(null); }, ms);
+      waiters.push(w);
+    });
+    return { promise: promise, cancel: function () { clearTimeout(w.timer); waiters = waiters.filter(function (x) { return x !== w; }); done(null); } };
+  }
+
+  async function emergencyStop() {
+    var c = cancelAll('STOP');
+    log('--', 'STOP pressed (dropped ' + c.dropped + ' queued, ' + c.waiting + ' waiting)');
+    var frame = P.requests.control('STOP');
+    if (isDry(true)) { writeFrame(frame, 'Control STOP', { wire: true }); steps('STOP (dry run, not sent)', 'err'); return; }
+    if (!connected) { banner('STOP NOT SENT: Bluetooth is disconnected. Use the machine controls.'); return; }
+    var stopWritten = false, alarmShown = false;
+    var alarm = setTimeout(function () {
+      if (!stopWritten) { alarmShown = true; banner('STOP NOT CONFIRMED SENT after 1.5 s. Bluetooth may be stuck. Use the machine\'s own stop now.'); }
+    }, 1500);
+    for (var attempt = 1; attempt <= 2 && connected; attempt++) {
+      // A write that has been in flight for a while is stuck: do not queue behind it.
+      var direct = attempt > 1 || (headSince !== 0 && Date.now() - headSince > 300);
+      var wait = expectReply(P.FUNC.CONTROL, 1200);
+      try {
+        await writeFrame(frame, 'Control STOP (try ' + attempt + (direct ? ', direct' : '') + ')', { wire: true, direct: direct, urgent: true });
+        stopWritten = true;
+        if (alarmShown) { alarmShown = false; banner(''); }
+      } catch (e) { log('ERR', 'STOP write: ' + e.message); wait.cancel(); continue; }
+      var rep = await wait.promise;
+      if (rep) { clearTimeout(alarm); steps('STOP sent, reply payload [' + P.hex(rep.payload) + ']', 'err'); return; }
+    }
+    clearTimeout(alarm);
+    banner(stopWritten ? 'STOP was written but the machine did not reply. Check the machine and use its own controls.'
+                       : 'STOP NOT SENT: the Bluetooth write failed. Use the machine\'s own controls.');
+  }
+
+  async function pause() {
+    var c = cancelAll('PAUSE');   // a pending start sequence must not carry on after a pause
+    log('--', 'PAUSE pressed (dropped ' + c.dropped + ' queued, ' + c.waiting + ' waiting)');
+    try { checked(await request('Control PAUSE', P.FUNC.CONTROL, P.requests.control('PAUSE'), { front: true, wire: true }), 'PAUSE'); steps('PAUSE sent', 'ok'); }
+    catch (e) { steps('PAUSE failed: ' + e.message, 'err'); }
+  }
+
+  // ---------- editor ----------
+  var NAMES = { horz: 'Horiz', speed: 'Speed', spin: 'Spin', height: 'Height', feed: 'Feed' };
+  function renderEditor(group) {
+    var host = $('ed' + group); host.textContent = '';
+    S[group].forEach(function (shot, idx) {
+      var box = document.createElement('div'); box.className = 'shot';
+      var h = document.createElement('h3'); h.textContent = group + (idx + 1); box.appendChild(h);
+      P.FIELDS.forEach(function (f) {
+        var row = document.createElement('div'); row.className = 'sl';
+        var nm = document.createElement('div'); nm.className = 'nm'; nm.textContent = NAMES[f];
+        var val = document.createElement('div'); val.className = 'val';
+        var inp = document.createElement('input'); inp.type = 'range'; inp.min = P.RANGES[f][0]; inp.max = P.RANGES[f][1]; inp.step = 1; inp.value = shot[f];
+        function show() { val.innerHTML = ''; var b = document.createElement('b'); b.textContent = shot[f]; val.appendChild(b); val.appendChild(document.createTextNode(' ' + P.label(f, shot[f]))); }
+        inp.addEventListener('input', function () { shot[f] = parseInt(inp.value, 10); show(); save(); });
+        show(); row.appendChild(nm); row.appendChild(val); row.appendChild(inp); box.appendChild(row);
+      });
+      host.appendChild(box);
+    });
+  }
+
+  // ---------- wiring ----------
+  load();
+  renderEditor('A'); renderEditor('B');
+  ['slot', 'pairs', 'repeat', 'pos'].forEach(function (k) { $(k).value = S.cfg[k]; $(k).addEventListener('change', readCfg); });
+  readCfg();
+  if (!navigator.bluetooth) { $('noBt').style.display = 'block'; $('btnConnect').disabled = true; $('dry').checked = true; dry = true; setConn('dry run (no Bluetooth)', 'warn'); }
+  try { var p0 = localStorage.getItem(PINKEY); if (p0) $('pin').value = p0; } catch (e) {}
+  $('dry').addEventListener('change', function () { dry = $('dry').checked; if (dry) setConn('dry run: nothing is sent', 'warn'); else setConn(connected ? 'connected' : 'not connected', connected ? 'ok' : ''); });
+  $('btnConnect').addEventListener('click', connect);
+  $('btnStart').addEventListener('click', startDrill);
+  $('btnStop').addEventListener('click', emergencyStop);
+  $('btnPause').addEventListener('click', pause);
+  $('btnReset').addEventListener('click', function () { var d = defaults(); S.A = d.A; S.B = d.B; save(); renderEditor('A'); renderEditor('B'); });
+  $('btnPin').addEventListener('click', async function () {
+    var code = $('pin').value.trim();
+    if (!/^\d{6}$/.test(code)) { $('pinChip').textContent = 'need 6 digits'; $('pinChip').className = 'chip bad'; return; }
+    var r = await verify(1, code); if (r === 'ok') banner('');
+  });
+  $('btnClear').addEventListener('click', function () { logLines = []; $('log').textContent = ''; });
+  $('btnCopy').addEventListener('click', async function () {
+    var text = logLines.join('\n'), msg = $('copyMsg');
+    try { await navigator.clipboard.writeText(text); msg.textContent = 'copied ' + logLines.length + ' lines'; }
+    catch (e) {
+      var ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); msg.textContent = 'copied ' + logLines.length + ' lines'; } catch (e2) { msg.textContent = 'copy failed, select the log text by hand'; }
+      document.body.removeChild(ta);
+    }
+  });
+  log('--', 'page loaded; Web Bluetooth ' + (navigator.bluetooth ? 'available' : 'NOT available'));
+})();
+</script>
+</body>
+</html>
