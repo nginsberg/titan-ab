@@ -9,8 +9,11 @@ from dataclasses import dataclass, field
 
 FUNC = {
     "CONTROL": 0x01, "SET_CURRENT": 0x02, "EXEC_MANUAL": 0x03, "BALL_TEST": 0x04, "SAVE_DRILL": 0x08,
-    "STATUS": 0x17, "VERSION": 0x18, "VERIFY": 0x20,
+    "CRC_LIST": 0x13, "STATUS": 0x17, "VERSION": 0x18, "VERIFY": 0x20,
 }
+# Frames the machine sends on its own (seen on court, firmware 7.4.1PB14); labelled in the log, never waited for.
+PUSH = {0x11: "current ball push [drill, ballIndex]", 0x12: "voltage push"}
+MAX_DRILLS = 24     # the app's slot range; the machine stores drills contiguously 1..N
 CONTROL = {"START": 0, "PAUSE": 1, "STOP": 2}
 STATUS_NAMES = ["START", "PAUSE", "STOP", "INIT", "PENDING_START", "MOTO_STARTING",
                 "MOTO_STOPPING", "ALARM", "TESTING", "TEST_PAUSED"]
@@ -228,12 +231,24 @@ def save_drill_payload(number: int, name: str, balls: list[list[int]], machine_p
     return out
 
 
-def ab_balls(A: list[dict], B: list[dict], pairs: int) -> list[list[int]]:
+def ab_balls(A: list[dict], B: list[dict], pairs: int, out: dict | None = None) -> list[list[int]]:
+    """Random A, Random B, `pairs` times. With `out`, the last pair's B ball is Random of [B1, B3, out]."""
     balls = []
-    for _ in range(pairs):
+    for i in range(pairs):
         balls.append(ball_bytes(True, 1, A))
-        balls.append(ball_bytes(True, 1, B))
+        last_b = B if out is None or i < pairs - 1 else [B[0], B[2], out]
+        balls.append(ball_bytes(True, 1, last_b))
     return balls
+
+
+def out_pairs(out_every: int) -> int:
+    """Pairs in a drill with one out shot among 3 in the last B ball: about 1 B ball in 3 * pairs is out."""
+    return max(1, round(out_every / 3))
+
+
+def mirror_shot(s: dict) -> dict:
+    """Drill codes are written for the right half; the left half is the mirror image (horz 20 - h)."""
+    return dict(s, horz=20 - s["horz"])
 
 
 def repeat_slots(slot: int, n: int) -> list[int]:
@@ -305,6 +320,11 @@ def parse_drill_code(text) -> dict:
 # ---- requests ----
 def get_version() -> bytes:
     return build_frame(FUNC["VERSION"])
+
+
+def get_crc_list() -> bytes:
+    """Reply: 2 bytes per stored drill, so len(payload) // 2 drills."""
+    return build_frame(FUNC["CRC_LIST"])
 
 
 def get_status() -> bytes:

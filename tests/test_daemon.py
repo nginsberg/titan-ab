@@ -1,6 +1,7 @@
 """Daemon end to end with the fake machine, over the real unix socket."""
 import asyncio
 import io
+import json
 import os
 import shutil
 import signal
@@ -32,9 +33,9 @@ def short_runs_dir():
 
 
 class Harness:
-    def __init__(self, write_delay=0.0, pin=None, daemon_pin=None, initial_status=2):
+    def __init__(self, write_delay=0.0, pin=None, daemon_pin=None, initial_status=2, drills=0):
         self.runs = short_runs_dir()
-        self.fake = FakeTransport(write_delay=write_delay, pin=pin)
+        self.fake = FakeTransport(write_delay=write_delay, pin=pin, drills=drills)
         self.fake.status = initial_status
         self.out = io.StringIO()
         self.d = Daemon(self.fake, self.runs, pin=daemon_pin, keyboard=False, out=self.out, poll_interval=0.2,
@@ -57,7 +58,7 @@ class Harness:
     def cli(self, *argv):
         return cli.main(["--runs-dir", str(self.runs)] + list(argv))
 
-    def frames(self, skip=(F["STATUS"], F["VERSION"], F["VERIFY"])):
+    def frames(self, skip=(F["STATUS"], F["VERSION"], F["VERIFY"], F["CRC_LIST"])):
         return [(f, p) for f, p in list(self.fake.frames) if f not in skip]
 
     def clear(self):
@@ -71,7 +72,8 @@ class Harness:
 
 @pytest.fixture
 def h():
-    hh = Harness()
+    # 22 stored drills: slot 23 (fire --via drill's scratch slot) is the next free one, as the machine requires
+    hh = Harness(drills=22)
     yield hh
     hh.close()
 
@@ -90,14 +92,117 @@ def test_drill_sends_savedrill_setcurrent_start_in_order(h, capsys):
     assert "1. SaveDrill" in out and "3. Control START: reply payload [00]" in out
     g = P.parse_drill_code(CODE)["groups"]
     assert h.frames() == [
-        (F["SAVE_DRILL"], P.save_drill_payload(24, "AB RANDOM", P.ab_balls(g["A"], g["B"], 2))),
-        (F["SET_CURRENT"], [24] * 10),
+        (F["SAVE_DRILL"], P.save_drill_payload(23, "AB RANDOM", P.ab_balls(g["A"], g["B"], 2))),
+        (F["SET_CURRENT"], [23]),
         CTRL_START,
     ]
     h.clear()
-    assert h.cli("drill", CODE, "--pairs", "1", "--repeat", "1", "--slot", "5") == 0
-    assert h.frames()[1] == (F["SET_CURRENT"], [5])
+    assert h.cli("drill", CODE, "--pairs", "1", "--repeat", "3", "--slot", "5") == 0
+    assert h.frames()[1] == (F["SET_CURRENT"], [5, 5, 5])
     assert h.frames()[0][1][:7] == [5, 9] + list(b"AB RANDOM")[:5]
+
+
+def slot_of(h):
+    sd = [p for f, p in h.frames() if f == F["SAVE_DRILL"]]
+    return sd[-1][0] if sd else None
+
+
+def test_slot_is_next_free_then_reused(capsys):
+    hh = Harness(drills=16)
+    try:
+        assert hh.cli("drill", CODE) == 0
+        assert slot_of(hh) == 17 and hh.fake.drills == 17
+        assert "machine holds 16 drills; using slot 17 (next free)" in capsys.readouterr().out
+        assert json.loads((hh.runs / "drill_slot.json").read_text()) == {"slot": 17}
+        hh.clear()
+        assert hh.cli("drill", CODE) == 0          # our slot is <= N now: overwritten, the list does not grow
+        assert slot_of(hh) == 17 and hh.fake.drills == 17
+        assert hh.frames()[1] == (F["SET_CURRENT"], [17])
+    finally:
+        hh.close()
+
+
+def test_saved_slot_beyond_machine_count_is_ignored():
+    hh = Harness(drills=3)
+    try:
+        (hh.runs / "drill_slot.json").write_text(json.dumps({"slot": 9}))   # machine was wiped since
+        assert hh.cli("drill", CODE) == 0
+        assert slot_of(hh) == 4
+    finally:
+        hh.close()
+
+
+def test_explicit_slot_must_be_existing_or_next(capsys):
+    hh = Harness(drills=16)
+    try:
+        assert hh.cli("drill", CODE, "--slot", "23") == 1
+        assert "slot 23 is not available" in capsys.readouterr().out and hh.frames() == []
+        assert hh.cli("drill", CODE, "--slot", "5") == 0     # an existing slot is overwritten
+        assert slot_of(hh) == 5 and hh.fake.drills == 16
+    finally:
+        hh.close()
+
+
+def test_full_machine_refused_unless_slot_is_ours(capsys):
+    hh = Harness(drills=24)
+    try:
+        assert hh.cli("drill", CODE) == 1
+        assert "already holds 24 drills" in capsys.readouterr().out and hh.frames() == []
+        (hh.runs / "drill_slot.json").write_text(json.dumps({"slot": 20}))
+        assert hh.cli("drill", CODE) == 0
+        assert slot_of(hh) == 20
+    finally:
+        hh.close()
+
+
+def test_save_to_non_contiguous_slot_fails_the_sequence():
+    """The fake mirrors the machine: slot 23 on a 16-drill machine gets no reply and swallows the next frame."""
+    hh = Harness(drills=16)
+    try:
+        g = P.parse_drill_code(CODE)["groups"]
+        r = hh.call({"cmd": "fire", "shot": g["A"][0]})     # fire --via drill saves to scratch slot 23
+        assert not r["ok"] and "STOPPED at step 1" in r["error"] and "no reply" in r["error"]
+        assert hh.fake.drills == 16 and F["SET_CURRENT"] not in hh.fake.funcs()
+    finally:
+        hh.close()
+
+
+def test_half_left_mirrors_horz(h):
+    h.clear()
+    assert h.cli("drill", CODE, "--half", "left") == 0
+    g = P.parse_drill_code(CODE)["groups"]
+    A = [P.mirror_shot(s) for s in g["A"]]
+    B = [P.mirror_shot(s) for s in g["B"]]
+    assert [s["horz"] for s in A + B] == [20 - s["horz"] for s in g["A"] + g["B"]]
+    assert h.frames()[0] == (F["SAVE_DRILL"], P.save_drill_payload(23, "AB RANDOM", P.ab_balls(A, B, 2)))
+    assert P.mirror_shot({"horz": 1, "speed": 9, "spin": 10, "height": 20, "feed": 5})["horz"] == 19
+    assert P.mirror_shot({"horz": 10, "speed": 9, "spin": 10, "height": 20, "feed": 5})["horz"] == 10
+
+
+def test_out_ball_layout_and_checks(h, capsys):
+    h.clear()
+    out = "15.10.10.20.9"
+    assert h.cli("drill", CODE, "--out-ball", out) == 0
+    g = P.parse_drill_code(CODE)["groups"]
+    o = P.parse_shot(out)[0]
+    balls = P.ab_balls(g["A"], g["B"], 4, o)
+    assert len(balls) == 8
+    assert h.frames()[0] == (F["SAVE_DRILL"], P.save_drill_payload(23, "AB RANDOM", balls))
+    assert balls[7] == P.ball_bytes(True, 1, [g["B"][0], g["B"][2], o])          # 4th B: B1, B3, OUT
+    assert balls[1] == balls[3] == balls[5] == P.ball_bytes(True, 1, g["B"])     # other B balls untouched
+    assert "about 1 in 12 B balls" in capsys.readouterr().out
+    # not a multiple of 3: pairs = round(N/3), real rate 1 in 3 * pairs
+    assert P.out_pairs(12) == 4 and P.out_pairs(9) == 3 and P.out_pairs(10) == 3 and P.out_pairs(3) == 1
+    # the out ball is mirrored and speed-checked like every other shot
+    h.clear()
+    assert h.cli("drill", CODE, "--out-ball", out, "--half", "left") == 0
+    assert h.frames()[0][1][-5:] == [5, 10, 10, 20, 9]       # OUT is the last shot of the last ball: 20 - 15
+    h.clear()
+    assert h.cli("drill", CODE, "--out-ball", "15.18.10.20.9") == 1
+    assert "OUT speed level 18" in capsys.readouterr().out and h.frames() == []
+    assert h.cli("drill", CODE, "--out-ball", out, "--pairs", "2") == 1
+    r = h.call({"cmd": "drill", "A": g["A"], "B": g["B"], "out": dict(o, speed=18)})
+    assert not r["ok"] and "safety cap" in r["error"]
 
 
 def test_fire_via_drill_encodes(h, capsys):

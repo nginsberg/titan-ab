@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import signal
 import sys
 import time
@@ -196,6 +197,8 @@ class Daemon:
         self.fake = fake
         self.parser = P.FrameParser(self._on_frame)
         self.gen = 0
+        self.stream_task = None
+        self.stream_info = "-"
         self.gen_why = "STOP"
         self.waiters: list[Waiter] = []
         self.connected = False
@@ -267,7 +270,10 @@ class Daemon:
                 self.waiters.remove(w)
                 w.fut.set_result(fr)
                 return
-        self.log("RX", "unexpected frame (nothing waiting for func 0x%02x)" % fr.func)
+        if fr.func in P.PUSH:
+            self.log("RX", "machine push: %s" % P.PUSH[fr.func])
+        else:
+            self.log("RX", "unexpected frame (nothing waiting for func 0x%02x)" % fr.func)
 
     def _add_waiter(self, func, urgent=False) -> Waiter:
         w = Waiter(func, asyncio.get_running_loop().create_future(), urgent)
@@ -427,8 +433,9 @@ class Daemon:
         return {"ok": fr.crc_ok, "lines": ["START sent, reply payload [%s]" % P.hexs(fr.payload)]}
 
     # ---- sequences ----
-    async def run_sequence(self, steps) -> dict:
-        """steps: (name, func, frame, timeout, is_start). Captures the generation once: STOP/PAUSE kills every later step."""
+    async def run_sequence(self, steps, on_ok=None) -> dict:
+        """steps: (name, func, frame, timeout, is_start). Captures the generation once: STOP/PAUSE kills every later step.
+        on_ok(func) runs after each step whose reply came back CRC-valid."""
         if self._seq_lock.locked():
             return {"ok": False, "error": "busy: another fire/drill sequence is running"}
         async with self._seq_lock:
@@ -445,6 +452,8 @@ class Daemon:
                     fr = await self.request(name, func, frame, timeout, gen=g, on_written=mark)
                     if not fr.crc_ok:
                         raise NoReply("%s: reply failed the CRC check" % name)
+                    if on_ok:
+                        on_ok(func)
                     lines.append("%d. %s: reply payload [%s]" % (i + 1, name, P.hexs(fr.payload)))
                 lines.append("Done. Machine should be firing.")
                 return {"ok": True, "lines": lines}
@@ -494,23 +503,123 @@ class Daemon:
             return {"ok": False, "error": "via must be drill or balltest"}
         return await self.run_sequence(steps)
 
-    async def drill(self, A, B, pairs=2, repeat=10, slot=24, allow_fast=False) -> dict:
+    def _slot_file(self):
+        return self.runs / "drill_slot.json"
+
+    def _saved_slot(self):
+        try:
+            v = json.loads(self._slot_file().read_text()).get("slot")
+            return v if isinstance(v, int) and not isinstance(v, bool) else None
+        except (OSError, ValueError, AttributeError):
+            return None
+
+    def _save_slot(self, slot):
+        try:
+            self._slot_file().write_text(json.dumps({"slot": slot}))
+        except OSError:
+            pass
+
+    async def drill_count(self) -> int:
+        """N = number of drills stored on the machine (GetCrcList: 2 bytes per drill)."""
+        fr = await self.request("GetCrcList", F["CRC_LIST"], P.get_crc_list())
+        if not fr.crc_ok or len(fr.payload) % 2:
+            raise NoReply("GetCrcList reply unusable (%d payload bytes)" % len(fr.payload))
+        return len(fr.payload) // 2
+
+    async def drill(self, A, B, pairs=2, repeat=1, slot=None, allow_fast=False, out=None) -> dict:
+        """The machine only accepts SaveDrill for an existing slot or the next free one (it stores drills 1..N), so the
+        slot is chosen from GetCrcList: the slot we saved to before if it is <= N, else N+1. `slot` overrides (<= N+1)."""
         if len(A) != 3 or len(B) != 3:
             return {"ok": False, "error": "need exactly 3 shots in A and 3 in B"}
-        err = self._check_shots(list(A) + list(B), allow_fast)
+        err = self._check_shots(list(A) + list(B) + ([out] if out else []), allow_fast)
         if err:
             return {"ok": False, "error": err}
-        for nm, v, lo, hi in (("pairs", pairs, 1, 8), ("repeat", repeat, 1, 99), ("slot", slot, 1, 24)):
+        for nm, v, lo, hi in (("pairs", pairs, 1, 8), ("repeat", repeat, 1, 99)):
             if not isinstance(v, int) or isinstance(v, bool) or v < lo or v > hi:
                 return {"ok": False, "error": "%s must be %d-%d" % (nm, lo, hi)}
-        frame = P.save_drill(slot, "AB RANDOM", P.ab_balls(A, B, pairs))
+        if slot is not None and (not isinstance(slot, int) or isinstance(slot, bool) or not 1 <= slot <= P.MAX_DRILLS):
+            return {"ok": False, "error": "slot must be 1-%d" % P.MAX_DRILLS}
+        try:
+            n = await self.drill_count()
+        except Cancelled as e:
+            return {"ok": False, "error": "cancelled by %s" % e}
+        except Exception as e:
+            return {"ok": False, "error": "could not read the machine's drill list, nothing saved: %s" % e}
+        saved = self._saved_slot()
+        if slot is not None:
+            if slot > n + 1:
+                return {"ok": False, "error": "slot %d is not available: the machine holds %d drills, so use a slot "
+                        "from 1 to %d" % (slot, n, n + 1)}
+            why = "--slot"
+        elif saved is not None and 1 <= saved <= n:
+            slot, why = saved, "reusing our slot"
+        elif n + 1 > P.MAX_DRILLS:
+            return {"ok": False, "error": "the machine already holds %d drills (max %d) and none is ours to reuse; "
+                    "delete one on the machine, or pick a slot with --slot" % (n, P.MAX_DRILLS)}
+        else:
+            slot, why = n + 1, "next free"
+        frame = P.save_drill(slot, "AB RANDOM", P.ab_balls(A, B, pairs, out))
         steps = [
             ("SaveDrill slot %d (%d pairs)" % (slot, pairs), F["SAVE_DRILL"], frame, SAVE_DRILL_TIMEOUT, False),
             ("SetCurrentDrill x%d" % repeat, F["SET_CURRENT"], P.set_current(P.repeat_slots(slot, repeat)),
              REPLY_TIMEOUT, False),
             ("Control START", F["CONTROL"], P.control("START"), REPLY_TIMEOUT, True),
         ]
-        return await self.run_sequence(steps)
+        r = await self.run_sequence(steps, on_ok=lambda f: self._save_slot(slot) if f == F["SAVE_DRILL"] else None)
+        r["lines"] = ["machine holds %d drills; using slot %d (%s)" % (n, slot, why)] + r.get("lines", [])
+        return r
+
+    async def stream(self, A, B, pairs=20, allow_fast=False) -> dict:
+        """A/B drill without SaveDrill: the laptop picks a random A shot, fires it as a
+        one-ball BallTest, waits that shot's feed time, then does the same for B. STOP (any source) ends it."""
+        if not A or not B:
+            return {"ok": False, "error": "need at least one shot in A and in B"}
+        err = self._check_shots(list(A) + list(B), allow_fast)
+        if err:
+            return {"ok": False, "error": err}
+        if not isinstance(pairs, int) or isinstance(pairs, bool) or not 1 <= pairs <= 100:
+            return {"ok": False, "error": "pairs must be 1-100"}
+        if self.stream_task is not None and not self.stream_task.done():
+            return {"ok": False, "error": "busy: a stream is already running (STOP it first)"}
+        self.stream_task = asyncio.ensure_future(self._stream_loop(A, B, pairs, self.gen))
+        return {"ok": True, "lines": ["stream started: %d pairs (%d balls). STOP ends it." % (pairs, 2 * pairs)]}
+
+    async def _stream_loop(self, A, B, pairs, g0):
+        async def wait(sec):
+            end = time.monotonic() + sec
+            while time.monotonic() < end:
+                if self.gen != g0:
+                    return False
+                await asyncio.sleep(0.1)
+            return self.gen == g0
+        try:
+            for p in range(pairs):
+                for grp, shots in (("A", A), ("B", B)):
+                    if self.gen != g0 or not self.connected:
+                        self.say("stream ended (STOP or disconnect)")
+                        return
+                    i = random.randrange(len(shots))
+                    s = shots[i]
+                    r = await self.run_sequence([
+                        ("BallTest %s%d" % (grp, i + 1), F["BALL_TEST"], P.ball_test(False, 1, [s]), REPLY_TIMEOUT, False),
+                        ("Control START", F["CONTROL"], P.control("START"), REPLY_TIMEOUT, True)])
+                    self.stream_info = "pair %d/%d %s%d" % (p + 1, pairs, grp, i + 1)
+                    self.say("stream %s: %s" % (self.stream_info, "ok" if r.get("ok") else r.get("error")))
+                    if not r.get("ok"):
+                        if self.gen != g0:
+                            return
+                        if START_SENT not in str(r.get("error")):
+                            self.loud("stream aborted: %s" % r.get("error"))
+                            return
+                    if not await wait(P.FEED_SEC[s["feed"] - 1]):
+                        self.say("stream ended (STOP)")
+                        return
+            self.say("stream finished %d pairs; sending STOP to spin down" % pairs)
+            await self.stop("stream finished")
+        except Exception as e:
+            self.loud("stream crashed: %r - press SPACE to STOP" % (e,))
+        finally:
+            self.stream_info = "-"
 
     # ---- connect / PIN / poll ----
     def _pin_file(self):
@@ -748,7 +857,7 @@ class Daemon:
                 "version": self.version.text.replace("\0", "") if self.version else None,
                 "needs_pin": self.version.needs_pin if self.version else None, "pin": self.pin_state, "pin_needed": self.pin_needed,
                 "machine_status": self.machine_status, "last_cmd": self.last_cmd,
-                "sequence_running": self.sequence_running, "alarms": self.alarms[-3:]}}
+                "sequence_running": self.sequence_running, "stream": self.stream_info, "alarms": self.alarms[-3:]}}
         if cmd == "stop":
             self.say("STOP from client")
             r = await self.stop("STOP command")
@@ -757,7 +866,7 @@ class Daemon:
         else:
             if not self.connected:
                 return {"ok": False, "error": "not connected to the machine"}
-            if cmd in ("start", "fire", "drill") and self.stop_task is not None and not self.stop_task.done():
+            if cmd in ("start", "fire", "drill", "stream") and self.stop_task is not None and not self.stop_task.done():
                 return {"ok": False, "error": "a STOP is still in progress; try again in a few seconds"}
             if cmd == "pause":
                 r = await self.pause()
@@ -767,7 +876,20 @@ class Daemon:
                 r = await self.fire(req.get("shot") or {}, req.get("via", "drill"), req.get("allow_fast") is True)
             elif cmd == "drill":
                 r = await self.drill(req.get("A") or [], req.get("B") or [], req.get("pairs", 2),
-                                     req.get("repeat", 10), req.get("slot", 24), req.get("allow_fast") is True)
+                                     req.get("repeat", 1), req.get("slot"), req.get("allow_fast") is True,
+                                     req.get("out"))
+            elif cmd == "stream":
+                r = await self.stream(req.get("A") or [], req.get("B") or [], req.get("pairs", 20),
+                                      req.get("allow_fast") is True)
+            elif cmd == "raw":
+                # Debug: one frame by func + hex payload; waits for a reply with the same func (or times out).
+                func = int(req["func"])
+                payload = bytes.fromhex(req.get("payload", ""))
+                try:
+                    fr = await self.request("raw 0x%02x" % func, func, P.build_frame(func, payload), float(req.get("timeout", 3.0)))
+                    r = {"ok": fr.crc_ok, "lines": ["raw 0x%02x reply payload [%s]" % (func, P.hexs(fr.payload))]}
+                except NoReply as e:
+                    r = {"ok": False, "lines": [], "error": str(e)}
             elif cmd == "pin":
                 code = str(req.get("code", ""))
                 res = await self.verify(1, code)

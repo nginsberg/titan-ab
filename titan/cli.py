@@ -186,6 +186,8 @@ def cmd_status(args) -> int:
     print("version: %s   pin: %s" % (d.get("version"), d.get("pin")))
     print("machine status: %s" % d.get("machine_status"))
     print("last command: %s" % d.get("last_cmd"))
+    if d.get("stream", "-") != "-":
+        print("stream: %s" % d.get("stream"))
     if d.get("sequence_running"):
         print("a fire/drill sequence is running")
     if d.get("pin_needed"):
@@ -245,21 +247,72 @@ def cmd_fire(args) -> int:
     return show(call(args, {"cmd": "fire", "shot": s, "via": args.via, "allow_fast": args.allow_fast}))
 
 
-def cmd_drill(args) -> int:
+DEFAULT_CODE = "A 13.9.11.22.3 15.10.12.18.3 19.8.8.21.3 B 15.9.13.15.9 12.7.9.20.9 19.7.11.21.9"
+
+
+def named_shots(args, extra=()):
+    """Parse the code, mirror for --half left, return (named shots incl. extras, error)."""
     r = P.parse_drill_code(args.code)
     if not r["ok"]:
-        print("REFUSED: " + r["error"])
+        return None, r["error"]
+    named = [("%s%d" % (g, i + 1), s) for g in ("A", "B") for i, s in enumerate(r["groups"][g])] + list(extra)
+    if args.half == "left":
+        named = [(nm, P.mirror_shot(s)) for nm, s in named]
+        print("left half: horz mirrored (20 - h)")
+    return named, None
+
+
+def cmd_drill(args) -> int:
+    extra = []
+    pairs = args.pairs
+    if args.out_ball:
+        out, err = P.parse_shot(args.out_ball, "--out-ball")
+        if err:
+            print("REFUSED: " + err)
+            return 1
+        if pairs is not None:
+            print("REFUSED: --pairs and --out-ball conflict: --out-every sets the pairs")
+            return 1
+        if not 3 <= args.out_every <= 24:
+            print("REFUSED: --out-every must be 3-24")
+            return 1
+        pairs = P.out_pairs(args.out_every)
+        extra = [("OUT", out)]
+    pairs = 2 if pairs is None else pairs
+    named, err = named_shots(args, extra)
+    if err:
+        print("REFUSED: " + err)
         return 1
-    named = [("%s%d" % (g, i + 1), s) for g in ("A", "B") for i, s in enumerate(r["groups"][g])]
     prepared = prepare(args, named)
     if prepared is None:
         return 1
     A = [s for nm, s in prepared if nm.startswith("A")]
     B = [s for nm, s in prepared if nm.startswith("B")]
-    print("drill slot %d, %d pairs, repeat %d: %s" % (args.slot, args.pairs, args.repeat,
+    out_s = next((s for nm, s in prepared if nm == "OUT"), None)
+    print("drill slot %s, %d pairs, repeat %d: %s" % (args.slot or "auto", pairs, args.repeat,
                                                        P.format_drill_code({"A": A, "B": B})))
-    return show(call(args, {"cmd": "drill", "A": A, "B": B, "pairs": args.pairs, "repeat": args.repeat,
-                            "slot": args.slot, "allow_fast": args.allow_fast}, timeout=60.0))
+    if out_s:
+        print("out ball %s in the last B ball: about 1 in %d B balls" % (P.shot_code(out_s), 3 * pairs))
+    return show(call(args, {"cmd": "drill", "A": A, "B": B, "pairs": pairs, "repeat": args.repeat,
+                            "slot": args.slot, "allow_fast": args.allow_fast, "out": out_s}, timeout=60.0))
+
+
+def cmd_stream(args) -> int:
+    named, err = named_shots(args)
+    if err:
+        print("REFUSED: " + err)
+        return 1
+    prepared = prepare(args, named)
+    if prepared is None:
+        return 1
+    A = [s for nm, s in prepared if nm.startswith("A")]
+    B = [s for nm, s in prepared if nm.startswith("B")]
+    print("stream %d pairs: %s" % (args.pairs, P.format_drill_code({"A": A, "B": B})))
+    return show(call(args, {"cmd": "stream", "A": A, "B": B, "pairs": args.pairs, "allow_fast": args.allow_fast}))
+
+
+def cmd_raw(args) -> int:
+    return show(call(args, {"cmd": "raw", "func": int(args.func, 0), "payload": args.payload, "timeout": args.timeout}))
 
 
 def cmd_calib(args) -> int:
@@ -320,13 +373,34 @@ def build_parser():
     f.add_argument("--raw", action="store_true", help="ignore calibration")
     f.add_argument("--allow-fast", action="store_true", help="allow speed level above 14 (50 mph)")
 
+    half = dict(choices=["right", "left"], default="right",
+                help="drill codes are written for the right half; left mirrors horz as 20 - h (default right)")
     dr = sub.add_parser("drill", help='A/B random drill: "A h.s.sp.ht.f x3 B h.s.sp.ht.f x3"')
-    dr.add_argument("code")
-    dr.add_argument("--pairs", type=int, default=2)
-    dr.add_argument("--repeat", type=int, default=10)
-    dr.add_argument("--slot", type=int, default=24)
+    dr.add_argument("code", nargs="?", default=DEFAULT_CODE, help="default: the code that worked on court 2026-10-28")
+    dr.add_argument("--pairs", type=int, default=None, help="Random A + Random B pairs (default 2)")
+    dr.add_argument("--repeat", type=int, default=1, help="slot repeated N times in SetCurrentDrill (default 1: the "
+                    "saved drill loops natively on the machine)")
+    dr.add_argument("--slot", type=int, default=None, help="override the automatic slot; must be <= drills stored + 1")
+    dr.add_argument("--half", **half)
+    dr.add_argument("--out-ball", metavar="CODE", help="a shot code for an out ball, written for the right half; the "
+                    "last pair's B ball becomes Random of [B1, B3, OUT]")
+    dr.add_argument("--out-every", type=int, default=12, help="with --out-ball, about 1 B ball in N is out (default "
+                    "12 = 4 pairs, since the out ball is 1 of 3 in one B ball of N/3 pairs); pairs = round(N/3), so "
+                    "a N that is not a multiple of 3 is approximate: the real rate is 1 in 3*pairs (3-24)")
     dr.add_argument("--raw", action="store_true")
     dr.add_argument("--allow-fast", action="store_true")
+
+    st = sub.add_parser("stream", help="A/B drill fired ball by ball from the laptop (no SaveDrill)")
+    st.add_argument("code", nargs="?", default=DEFAULT_CODE)
+    st.add_argument("--pairs", type=int, default=20)
+    st.add_argument("--half", **half)
+    st.add_argument("--raw", action="store_true")
+    st.add_argument("--allow-fast", action="store_true")
+
+    rw = sub.add_parser("raw", help="debug: send one frame (func, hex payload) and show the reply")
+    rw.add_argument("func")
+    rw.add_argument("payload", nargs="?", default="")
+    rw.add_argument("--timeout", type=float, default=3.0)
 
     cb = sub.add_parser("calib", help="aim offsets applied to fire/drill")
     cb.add_argument("action", choices=["show", "set", "reset"])
@@ -341,7 +415,7 @@ def main(argv=None) -> int:
         from . import daemon
         return daemon.main(args, args.runs_dir)
     handlers = {"status": cmd_status, "log": cmd_log, "stop": cmd_stop, "pause": cmd_simple, "start": cmd_simple,
-                "fire": cmd_fire, "drill": cmd_drill, "calib": cmd_calib, "pin": cmd_pin}
+                "fire": cmd_fire, "drill": cmd_drill, "calib": cmd_calib, "pin": cmd_pin, "stream": cmd_stream, "raw": cmd_raw}
     return handlers[args.cmd](args)
 
 
