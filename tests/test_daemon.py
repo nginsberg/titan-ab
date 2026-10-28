@@ -601,3 +601,150 @@ def test_client_timeout_message_mentions_sequence(monkeypatch, capsys, tmp_path)
     assert cli.main(["--runs-dir", str(tmp_path), "start"]) == 2
     out = capsys.readouterr().out
     assert "may still be running; check `status` or run `stop`" in out
+
+
+# ---- STOP racing GetCrcList, stream, raw ----
+SHOT = {"horz": 10, "speed": 9, "spin": 11, "height": 21, "feed": 1}
+
+
+def test_stop_after_crc_list_reply_before_sequence_sends_nothing(tmp_path):
+    async def go(via):
+        fake = FakeTransport(drills=3)
+        d = Daemon(fake, tmp_path / via, keyboard=False, out=io.StringIO(), fake=True)
+        d._loop = asyncio.get_running_loop()
+        d._write_lock, d._req_lock, d._seq_lock = asyncio.Lock(), asyncio.Lock(), asyncio.Lock()
+        fake.set_callbacks(d._on_notify, d._on_disconnect)
+        await fake.connect()
+        d.connected = True
+        orig = d._on_frame
+        hit = []
+
+        def hook(fr):
+            orig(fr)
+            if fr.func == F["CRC_LIST"] and not hit:
+                hit.append(1)
+                d.cancel_all("STOP key")   # STOP handled right after the reply is delivered
+        d.parser.on_frame = hook
+        groups = P.parse_drill_code(CODE)["groups"]
+        if via == "drill":
+            r = await d.drill(groups["A"], groups["B"])
+        else:
+            r = await d.fire(SHOT, "drill")
+        await asyncio.sleep(0.2)
+        assert hit and not r["ok"]
+        assert [f for f, _ in fake.frames] == [F["CRC_LIST"]]
+    for via in ("drill", "fire"):
+        asyncio.run(go(via))
+
+
+def _stream(h, pairs=1, shot=SHOT):
+    return h.call({"cmd": "stream", "A": [shot], "B": [shot], "pairs": pairs})
+
+
+def test_stop_during_stream_feed_wait_ends_it(h):
+    h.clear()
+    assert _stream(h, pairs=3, shot=dict(SHOT, feed=5))["ok"]   # 3 s feed wait
+    time.sleep(0.6)
+    assert [f for f, _ in h.frames()] == [F["BALL_TEST"], F["CONTROL"]]
+    assert h.call({"cmd": "stop"})["ok"]
+    time.sleep(0.8)
+    n = len(h.frames())
+    time.sleep(3.5)
+    fr = h.frames()
+    assert len(fr) == n and fr[-1] == CTRL_STOP
+    assert [f for f, _ in fr].count(F["BALL_TEST"]) == 1 and fr.count(CTRL_START) == 1
+    assert h.call({"cmd": "status"})["data"]["stream"] == "-"
+
+
+def test_stop_during_stream_balltest_step_cancels_before_start(h):
+    h.call({"cmd": "fake", "no_reply": [F["BALL_TEST"]], "clear": True})
+    assert _stream(h)["ok"]
+    time.sleep(0.5)
+    assert h.call({"cmd": "stop"})["ok"]
+    time.sleep(2.5)
+    fr = h.frames()
+    assert [f for f, _ in fr] == [F["BALL_TEST"], F["CONTROL"]] and fr[-1] == CTRL_STOP
+    assert CTRL_START not in fr
+
+
+def test_finished_stream_sends_stop(h):
+    h.clear()
+    assert _stream(h)["ok"]
+    t0 = time.time()
+    while CTRL_STOP not in h.frames():
+        assert time.time() - t0 < 8, h.frames()
+        time.sleep(0.1)
+    assert [f for f, _ in h.frames()] == [F["BALL_TEST"], F["CONTROL"], F["BALL_TEST"], F["CONTROL"], F["CONTROL"]]
+    assert h.frames()[-1] == CTRL_STOP
+
+
+def test_stream_refusals_and_exclusion(h):
+    h.clear()
+    r = h.call({"cmd": "stream", "A": [dict(SHOT, speed=15)], "B": [SHOT], "pairs": 1})
+    assert not r["ok"] and "safety cap" in r["error"]
+    assert h.frames() == []
+    assert _stream(h, pairs=3, shot=dict(SHOT, feed=5))["ok"]
+    assert "already running" in _stream(h)["error"]
+    for req in ({"cmd": "fire", "shot": SHOT}, {"cmd": "drill", "A": [SHOT] * 3, "B": [SHOT] * 3},
+                {"cmd": "start"}, {"cmd": "raw", "func": 1, "payload": "02"}):
+        r = h.call(req)
+        assert not r["ok"] and "stream running, STOP it first" in r["error"], req
+    time.sleep(0.3)
+    assert [f for f, _ in h.frames()] == [F["BALL_TEST"], F["CONTROL"]]   # only the stream's own ball
+    assert h.call({"cmd": "stop"})["ok"]
+
+
+def test_shutdown_cancels_stream():
+    hh = Harness(drills=22)
+    assert _stream(hh, pairs=3, shot=dict(SHOT, feed=5))["ok"]
+    time.sleep(0.4)
+    task = hh.d.stream_task
+    hh.close()
+    assert task.done()
+
+
+def test_raw_refusals(h):
+    h.clear()
+    for func, payload in ((F["CONTROL"], "00"), (F["BALL_TEST"], ""), (F["EXEC_MANUAL"], "0102"),
+                          (F["SAVE_DRILL"], "01"), (F["SET_CURRENT"], "01")):
+        r = h.call({"cmd": "raw", "func": func, "payload": payload})
+        assert not r["ok"] and "--unsafe" in r["error"], (func, payload)
+    assert h.frames() == []
+    for bad in (-1, 256, "1", True, None):
+        assert not h.call({"cmd": "raw", "func": bad})["ok"]
+    assert "timeout" in h.call({"cmd": "raw", "func": 1, "payload": "02", "timeout": 11})["error"]
+    assert "timeout" in h.call({"cmd": "raw", "func": 1, "payload": "02", "timeout": 0})["error"]
+    assert not h.call({"cmd": "raw", "func": 1, "payload": "zz"})["ok"]
+    assert h.frames() == []
+    # STOP and unlisted frames are fine without --unsafe; unsafe: true lets a listed frame through
+    assert h.call({"cmd": "raw", "func": F["CONTROL"], "payload": "02"})["ok"]
+    assert h.call({"cmd": "raw", "func": F["CONTROL"], "payload": "00", "unsafe": True})["ok"]
+    assert h.frames() == [CTRL_STOP, CTRL_START]
+    h.call({"cmd": "stop"})
+
+
+def test_raw_refused_while_stop_in_progress_and_while_sequence_busy(h):
+    h.call({"cmd": "fake", "hang": True, "clear": True})
+    t, box = _run_bg(lambda: h.call({"cmd": "stop"}))
+    time.sleep(0.3)
+    r = h.call({"cmd": "raw", "func": 1, "payload": "02"})
+    assert not r["ok"] and "STOP is still in progress" in r["error"]
+    t.join(15)
+    h.call({"cmd": "fake", "hang": False})
+    time.sleep(0.5)
+    h.call({"cmd": "fake", "no_reply": [F["SAVE_DRILL"]], "clear": True})
+    t, box = _run_bg(lambda: h.call({"cmd": "fire", "shot": SHOT}))
+    time.sleep(0.5)
+    r = h.call({"cmd": "raw", "func": F["STATUS"]})
+    assert not r["ok"] and "busy" in r["error"]
+    h.call({"cmd": "stop"})
+    t.join(10)
+
+
+def test_cli_raw_unsafe_flag(h, capsys):
+    h.clear()
+    assert h.cli("raw", "1", "00") == 1
+    assert h.frames() == []
+    assert h.cli("raw", "1", "00", "--unsafe") == 0
+    assert h.frames() == [CTRL_START]
+    h.call({"cmd": "stop"})

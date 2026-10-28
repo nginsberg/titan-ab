@@ -312,7 +312,8 @@ def cmd_stream(args) -> int:
 
 
 def cmd_raw(args) -> int:
-    return show(call(args, {"cmd": "raw", "func": int(args.func, 0), "payload": args.payload, "timeout": args.timeout}))
+    return show(call(args, {"cmd": "raw", "func": int(args.func, 0), "payload": args.payload, "timeout": args.timeout,
+                       "unsafe": args.unsafe}))
 
 
 def cmd_calib(args) -> int:
@@ -403,6 +404,7 @@ def build_parser():
     rw.add_argument("func")
     rw.add_argument("payload", nargs="?", default="")
     rw.add_argument("--timeout", type=float, default=3.0)
+    rw.add_argument("--unsafe", action="store_true", help="allow frames that can start the machine or change drills")
 
     cb = sub.add_parser("calib", help="aim offsets applied to fire/drill")
     cb.add_argument("action", choices=["show", "set", "reset"])

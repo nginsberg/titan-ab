@@ -432,14 +432,15 @@ class Daemon:
         return {"ok": fr.crc_ok, "lines": ["START sent, reply payload [%s]" % P.hexs(fr.payload)]}
 
     # ---- sequences ----
-    async def run_sequence(self, steps, on_ok=None) -> dict:
-        """steps: (name, func, frame, timeout, is_start). Captures the generation once: STOP/PAUSE kills every later step.
+    async def run_sequence(self, steps, on_ok=None, gen=None) -> dict:
+        """steps: (name, func, frame, timeout, is_start). STOP/PAUSE kills every later step. `gen` is the generation the
+        caller captured before its first await (fire/drill/stream); None captures it now.
         on_ok(func) runs after each step whose reply came back CRC-valid."""
         if self._seq_lock.locked():
             return {"ok": False, "error": "busy: another fire/drill sequence is running"}
         async with self._seq_lock:
             self.sequence_running = True
-            g = self.gen
+            g = self.gen if gen is None else gen
             lines = []
             state = {"start_written": False, "step": 0}
             try:
@@ -485,8 +486,9 @@ class Daemon:
         err = self._check_shots([shot], allow_fast)
         if err:
             return {"ok": False, "error": err}
+        g = self.gen   # captured before any await: a STOP during GetCrcList must still cancel this fire
         if via == "drill":
-            picked = await self._pick_slot()
+            picked = await self._pick_slot(gen=g)
             if isinstance(picked, dict):
                 return picked
             slot, why, n = picked
@@ -497,7 +499,8 @@ class Daemon:
                 ("SetCurrentDrill [%d]" % slot, F["SET_CURRENT"], P.set_current([slot]), REPLY_TIMEOUT, False),
                 ("Control START", F["CONTROL"], P.control("START"), REPLY_TIMEOUT, True),
             ]
-            r = await self.run_sequence(steps, on_ok=lambda f: self._save_slot(slot) if f == F["SAVE_DRILL"] else None)
+            r = await self.run_sequence(steps, on_ok=lambda f: self._save_slot(slot) if f == F["SAVE_DRILL"] else None,
+                                        gen=g)
             r["lines"] = ["machine holds %d drills; using slot %d (%s)" % (n, slot, why)] + r.get("lines", [])
             return r
         elif via == "balltest":
@@ -507,7 +510,7 @@ class Daemon:
             ]
         else:
             return {"ok": False, "error": "via must be drill or balltest"}
-        return await self.run_sequence(steps)
+        return await self.run_sequence(steps, gen=g)
 
     def _slot_file(self):
         return self.runs / "drill_slot.json"
@@ -525,21 +528,21 @@ class Daemon:
         except OSError:
             pass
 
-    async def drill_count(self) -> int:
+    async def drill_count(self, gen=None) -> int:
         """N = number of drills stored on the machine (GetCrcList: 2 bytes per drill)."""
-        fr = await self.request("GetCrcList", F["CRC_LIST"], P.get_crc_list())
+        fr = await self.request("GetCrcList", F["CRC_LIST"], P.get_crc_list(), gen=gen)
         if not fr.crc_ok or len(fr.payload) % 2:
             raise NoReply("GetCrcList reply unusable (%d payload bytes)" % len(fr.payload))
         return len(fr.payload) // 2
 
-    async def _pick_slot(self, slot=None):
+    async def _pick_slot(self, slot=None, gen=None):
         """The machine only accepts SaveDrill for an existing slot or the next free one (it stores drills 1..N), so the
         slot is chosen from GetCrcList: the slot we saved to before if it is <= N, else N+1. `slot` overrides (<= N+1).
         Returns (slot, why, N), or an {"ok": False, "error": ...} dict."""
         if slot is not None and (not isinstance(slot, int) or isinstance(slot, bool) or not 1 <= slot <= P.MAX_DRILLS):
             return {"ok": False, "error": "slot must be 1-%d" % P.MAX_DRILLS}
         try:
-            n = await self.drill_count()
+            n = await self.drill_count(gen)
         except Cancelled as e:
             return {"ok": False, "error": "cancelled by %s" % e}
         except Exception as e:
@@ -568,7 +571,8 @@ class Daemon:
         for nm, v, lo, hi in (("pairs", pairs, 1, 8), ("repeat", repeat, 1, 99)):
             if not isinstance(v, int) or isinstance(v, bool) or v < lo or v > hi:
                 return {"ok": False, "error": "%s must be %d-%d" % (nm, lo, hi)}
-        picked = await self._pick_slot(slot)
+        g = self.gen   # captured before any await
+        picked = await self._pick_slot(slot, g)
         if isinstance(picked, dict):
             return picked
         slot, why, n = picked
@@ -579,7 +583,8 @@ class Daemon:
              REPLY_TIMEOUT, False),
             ("Control START", F["CONTROL"], P.control("START"), REPLY_TIMEOUT, True),
         ]
-        r = await self.run_sequence(steps, on_ok=lambda f: self._save_slot(slot) if f == F["SAVE_DRILL"] else None)
+        r = await self.run_sequence(steps, on_ok=lambda f: self._save_slot(slot) if f == F["SAVE_DRILL"] else None,
+                                    gen=g)
         r["lines"] = ["machine holds %d drills; using slot %d (%s)" % (n, slot, why)] + r.get("lines", [])
         return r
 
@@ -616,7 +621,7 @@ class Daemon:
                     s = shots[i]
                     r = await self.run_sequence([
                         ("BallTest %s%d" % (grp, i + 1), F["BALL_TEST"], P.ball_test(False, 1, [s]), REPLY_TIMEOUT, False),
-                        ("Control START", F["CONTROL"], P.control("START"), REPLY_TIMEOUT, True)])
+                        ("Control START", F["CONTROL"], P.control("START"), REPLY_TIMEOUT, True)], gen=g0)
                     self.stream_info = "pair %d/%d %s%d" % (p + 1, pairs, grp, i + 1)
                     self.say("stream %s: %s" % (self.stream_info, "ok" if r.get("ok") else r.get("error")))
                     if not r.get("ok"):
@@ -880,8 +885,10 @@ class Daemon:
         else:
             if not self.connected:
                 return {"ok": False, "error": "not connected to the machine"}
-            if cmd in ("start", "fire", "drill", "stream") and self.stop_task is not None and not self.stop_task.done():
+            if cmd in ("start", "fire", "drill", "stream", "raw") and self.stop_task is not None and not self.stop_task.done():
                 return {"ok": False, "error": "a STOP is still in progress; try again in a few seconds"}
+            if cmd in ("start", "fire", "drill", "raw") and self.stream_running():
+                return {"ok": False, "error": "stream running, STOP it first"}
             if cmd == "pause":
                 r = await self.pause()
             elif cmd == "start":
@@ -896,14 +903,7 @@ class Daemon:
                 r = await self.stream(req.get("A") or [], req.get("B") or [], req.get("pairs", 20),
                                       req.get("allow_fast") is True)
             elif cmd == "raw":
-                # Debug: one frame by func + hex payload; waits for a reply with the same func (or times out).
-                func = int(req["func"])
-                payload = bytes.fromhex(req.get("payload", ""))
-                try:
-                    fr = await self.request("raw 0x%02x" % func, func, P.build_frame(func, payload), float(req.get("timeout", 3.0)))
-                    r = {"ok": fr.crc_ok, "lines": ["raw 0x%02x reply payload [%s]" % (func, P.hexs(fr.payload))]}
-                except NoReply as e:
-                    r = {"ok": False, "lines": [], "error": str(e)}
+                r = await self.raw(req)
             elif cmd == "pin":
                 code = str(req.get("code", ""))
                 res = await self.verify(1, code)
@@ -918,6 +918,41 @@ class Daemon:
         if r.get("error") and r.get("error") not in r.get("lines", []):
             self.say("  " + r["error"])
         return r
+
+    def stream_running(self) -> bool:
+        return self.stream_task is not None and not self.stream_task.done()
+
+    RAW_UNSAFE_FUNCS = (F["BALL_TEST"], F["EXEC_MANUAL"], F["SAVE_DRILL"], F["SET_CURRENT"])
+    RAW_TIMEOUT_MAX = 10.0
+
+    async def raw(self, req) -> dict:
+        """Debug: one frame by func + hex payload; waits for a reply with the same func (or times out). Frames that can
+        start the machine or change its drills are refused unless the request says unsafe: true."""
+        func = req.get("func")
+        if not isinstance(func, int) or isinstance(func, bool) or not 0 <= func <= 255:
+            return {"ok": False, "error": "func must be a whole number 0-255"}
+        try:
+            payload = bytes.fromhex(req.get("payload") or "")
+            timeout = float(req.get("timeout", 3.0))
+        except (ValueError, TypeError):
+            return {"ok": False, "error": "payload must be hex and timeout a number"}
+        if not 0 < timeout <= self.RAW_TIMEOUT_MAX:
+            return {"ok": False, "error": "timeout must be above 0 and at most %g s" % self.RAW_TIMEOUT_MAX}
+        starts = func == F["CONTROL"] and payload[:1] == bytes([P.CONTROL["START"]])
+        if (starts or func in self.RAW_UNSAFE_FUNCS) and req.get("unsafe") is not True:
+            return {"ok": False, "error": "raw 0x%02x with that payload can start the machine or change its drills; "
+                    "refused unless --unsafe" % func}
+        if self._seq_lock.locked():
+            return {"ok": False, "error": "busy: another fire/drill sequence is running"}
+        async with self._seq_lock:
+            self.sequence_running = True
+            try:
+                fr = await self.request("raw 0x%02x" % func, func, P.build_frame(func, payload), timeout)
+                return {"ok": fr.crc_ok, "lines": ["raw 0x%02x reply payload [%s]" % (func, P.hexs(fr.payload))]}
+            except NoReply as e:
+                return {"ok": False, "lines": [], "error": str(e)}
+            finally:
+                self.sequence_running = False
 
     def _fake_cmd(self, req) -> dict:
         if not self.fake:
@@ -978,6 +1013,8 @@ class Daemon:
         except Exception as e:
             self.say("STOP on shutdown failed: %s" % e, "ERR")
         self.quitting = True
+        if self.stream_running():
+            self.stream_task.cancel()
         self._quit.set()
 
     async def run(self):
@@ -1012,7 +1049,9 @@ class Daemon:
         finally:
             self.quitting = True
             self._keyboard_off()
-            for t in [conn, poll] + self._tasks:
+            for t in [conn, poll, self.stream_task] + self._tasks:
+                if t is None:
+                    continue
                 if not t.done():
                     t.cancel()
             if self._server:
