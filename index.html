@@ -34,6 +34,7 @@
   details > summary { min-height:44px; display:flex; align-items:center; font-weight:600; cursor:pointer; }
   .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
   .grid2 label { font-size:14px; color:var(--mut); display:block; }
+  textarea#code { font:13px/1.35 ui-monospace, Menlo, monospace; color:var(--fg); background:#0e1116; border:1px solid #2c3644; border-radius:8px; width:100%; padding:8px; resize:vertical; }
   pre#log { margin:0; max-height:300px; overflow:auto; white-space:pre-wrap; word-break:break-all; font:12px/1.35 ui-monospace, Menlo, monospace; background:#0a0d12; padding:8px; border-radius:8px; }
   #steps div { padding:3px 0; font-size:14px; word-break:break-word; } #steps .ok { color:#7be3a6; } #steps .err { color:#ff9a9d; }
   #stopbar { position:fixed; left:0; right:0; bottom:0; padding:8px 16px calc(8px + env(safe-area-inset-bottom)); background:linear-gradient(transparent, var(--bg) 25%); }
@@ -71,6 +72,12 @@
   </div>
 </div>
 
+<div class="card">
+  <h2>Drill code</h2>
+  <textarea id="code" rows="3" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="A 10.9.11.21.6 12.10.12.17.6 14.8.8.20.6 B 10.9.13.15.11 7.7.9.20.11 13.7.11.21.11"></textarea>
+  <div class="row" style="margin-top:6px"><button id="btnLoad">Load code</button><button id="btnCopyCode">Copy code</button></div>
+  <div id="codeMsg" class="mut" style="margin-top:6px"></div>
+</div>
 <div class="card"><h2>Group A</h2><div id="edA"></div></div>
 <div class="card"><h2>Group B</h2><div id="edB"></div></div>
 <div class="row" style="margin:0 0 12px"><button id="btnReset">Reset shots to defaults</button></div>
@@ -105,7 +112,7 @@
 
 <div id="stopbar"><div class="in"><button id="btnPause">Pause</button><button id="btnStop">STOP</button></div></div>
 
-<script src="protocol.js"></script>
+<script src="protocol.js?v=2"></script>
 <script>
 (function () {
   'use strict';
@@ -114,12 +121,11 @@
   var $ = function (id) { return document.getElementById(id); };
 
   // ---------- state ----------
-  // Defaults from the app's pickleball preset table (common/distance_height_data_manager.dart, machine position 0).
-  // Group A: speed-9 row (cells 10/12/14, fastest = deepest). Group B: speed-5 row (cells 1/2/3, short). Spin 10 = none.
+  // Default shots: A 10.9.11.21.6 12.10.12.17.6 14.8.8.20.6 / B 10.9.13.15.11 7.7.9.20.11 13.7.11.21.11 (horz.speed.spin.height.feed).
   function defaults() {
     return {
-      A: [{horz:4,speed:9,spin:10,height:20,feed:5}, {horz:10,speed:9,spin:10,height:20,feed:5}, {horz:16,speed:9,spin:10,height:20,feed:5}],
-      B: [{horz:6,speed:5,spin:10,height:26,feed:5}, {horz:10,speed:5,spin:10,height:23,feed:5}, {horz:14,speed:5,spin:10,height:26,feed:5}],
+      A: [{horz:10,speed:9,spin:11,height:21,feed:6}, {horz:12,speed:10,spin:12,height:17,feed:6}, {horz:14,speed:8,spin:8,height:20,feed:6}],
+      B: [{horz:10,speed:9,spin:13,height:15,feed:11}, {horz:7,speed:7,spin:9,height:20,feed:11}, {horz:13,speed:7,spin:11,height:21,feed:11}],
       cfg: {slot:24, pairs:2, repeat:10, pos:0}
     };
   }
@@ -511,6 +517,25 @@
   $('btnStop').addEventListener('click', emergencyStop);
   $('btnPause').addEventListener('click', pause);
   $('btnReset').addEventListener('click', function () { var d = defaults(); S.A = d.A; S.B = d.B; save(); renderEditor('A'); renderEditor('B'); });
+  // ---- drill code: paste to load all 6 shots, or copy the current ones ----
+  function codeMsg(text, ok) { var m = $('codeMsg'); m.textContent = text; m.style.color = ok ? 'var(--ok)' : 'var(--bad)'; }
+  $('btnLoad').addEventListener('click', function () {
+    if (sequenceRunning) { codeMsg('Not loaded: a drill is starting.', false); return; }
+    var r = P.parseDrillCode($('code').value);
+    if (!r.ok) { codeMsg('Not loaded, nothing changed: ' + r.error, false); return; }
+    S.A = r.groups.A; S.B = r.groups.B; save(); renderEditor('A'); renderEditor('B');
+    codeMsg('Loaded all 6 shots.', true);
+  });
+  setInterval(function () { $('btnLoad').disabled = sequenceRunning; }, 250);
+  $('btnCopyCode').addEventListener('click', async function () {
+    var text = P.formatDrillCode({ A: S.A.map(P.clampShot), B: S.B.map(P.clampShot) });
+    $('code').value = text;
+    try { await navigator.clipboard.writeText(text); codeMsg('Copied: ' + text, true); }
+    catch (e) {
+      var ta = $('code'); ta.focus(); ta.select();
+      try { document.execCommand('copy'); codeMsg('Copied: ' + text, true); } catch (e2) { codeMsg('Code is in the box above; copy it by hand.', true); }
+    }
+  });
   $('btnPin').addEventListener('click', async function () {
     var code = $('pin').value.trim();
     if (!/^\d{6}$/.test(code)) { $('pinChip').textContent = 'need 6 digits'; $('pinChip').className = 'chip bad'; return; }

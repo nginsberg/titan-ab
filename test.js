@@ -120,6 +120,54 @@ t('general un-escape: 7D xx -> xx ^ 0x20', () => {
   const got = parseAll([wire]); eq(String(got.length), '1'); eq(got[0].crcOk, true); eq(got[0].payload, [0x00, 0x7e]);
 });
 
+// ---- drill codes ----
+const DEFAULT_CODE = 'A 10.9.11.21.6 12.10.12.17.6 14.8.8.20.6 B 10.9.13.15.11 7.7.9.20.11 13.7.11.21.11';
+const sh5 = (a) => ({ horz: a[0], speed: a[1], spin: a[2], height: a[3], feed: a[4] });
+t('parse default code', () => {
+  const r = P.parseDrillCode(DEFAULT_CODE);
+  eq(String(r.ok), 'true');
+  eq(JSON.stringify(r.groups.A[0]), JSON.stringify(sh5([10, 9, 11, 21, 6])));
+  eq(JSON.stringify(r.groups.B[2]), JSON.stringify(sh5([13, 7, 11, 21, 11])));
+  eq(String(r.groups.A.length + r.groups.B.length), '6');
+});
+t('format -> parse round trip', () => {
+  const g = { A: [[1, 1, 1, 1, 1], [19, 20, 19, 50, 20], [10, 5, 10, 20, 5]].map(sh5), B: [[3, 7, 10, 21, 5], [17, 7, 12, 21, 5], [10, 10, 10, 10, 10]].map(sh5) };
+  const text = P.formatDrillCode(g);
+  eq(text, 'A 1.1.1.1.1 19.20.19.50.20 10.5.10.20.5 B 3.7.10.21.5 17.7.12.21.5 10.10.10.10.10');
+  const r = P.parseDrillCode(text);
+  eq(JSON.stringify(r.groups), JSON.stringify(g));
+  eq(P.formatDrillCode(P.parseDrillCode(DEFAULT_CODE).groups), DEFAULT_CODE);
+});
+t('parse tolerates case, newlines, extra whitespace', () => {
+  const r = P.parseDrillCode('\n a 10.9.11.21.6\t12.10.12.17.6   14.8.8.20.6\nb 10.9.13.15.11 7.7.9.20.11\r\n13.7.11.21.11 \n');
+  eq(String(r.ok), 'true'); eq(P.formatDrillCode(r.groups), DEFAULT_CODE);
+});
+function rejects(text, re) { const r = P.parseDrillCode(text); if (r.ok || r.groups) throw new Error('should reject: ' + text); if (!re.test(r.error)) throw new Error('error "' + r.error + '" does not match ' + re); }
+t('code rejections (whole code, clear error)', () => {
+  rejects('A 10.9.11.21.6 12.10.12.17.6 B 10.9.13.15.11 7.7.9.20.11 13.7.11.21.11', /group A has 2 shots/);
+  rejects('A 10.9.11.21.6 12.10.12.17.6 14.8.8.20.6 B 10.9.13.15.11 7.7.9.20.11', /group B has 2 shots/);
+  rejects('A 10.9.11.21.6 12.21.12.17.6 14.8.8.20.6 B 10.9.13.15.11 7.7.9.20.11 13.7.11.21.11', /shot A2 speed 21 is out of range 1-20/);
+  rejects('A 10.9.11.21.6 12.10.12.17.6 14.8.8.20.6 B 10.9.13.15.11 7.7.9.20.11 13.7.11.51.11', /shot B3 height 51 is out of range 1-50/);
+  rejects('A 10.9.11.21.6 12.10.12.17.6 14.8.8.20.6 B 10.9.13.15.11 7.7.9.20.11 13.7.11.21.0', /shot B3 feed 0 is out of range 1-20/);
+  rejects('A 20.9.11.21.6 12.10.12.17.6 14.8.8.20.6 B 10.9.13.15.11 7.7.9.20.11 13.7.11.21.11', /shot A1 horz 20/);
+  rejects('A 10.9.11.21.6 12.10.12.17.6 14.8.8.20.6 B 10.9.20.15.11 7.7.9.20.11 13.7.11.21.11', /shot B1 spin 20/);
+  rejects('A 10.9.5.21.6 12.10.12.17.6 14.8.8.20.6 B 10.9.13.15.11 7.7.9.20.11 13.7.11.21.11'.replace('10.9.5', '10.9.5.5'), /shot A1 .* must be 5 whole numbers/);
+  rejects('A 10.9.11.21.6 12.10.12.17.6 14.8.8.20.6 B 10.9.13.15.11 7.7.9.20.11 13.7.11.21.11'.replace('10.9.11.21.6', '10.9.11.21.6.5'), /5 whole numbers/);
+  rejects('A 10.9.11.21.6 12.10.12.17.6 14.8.8.20.6 B 10.9.13.15.11 7.7.9.20.11 13.7.11.21.11'.replace('12.10', '12.x'), /shot A2/);
+  rejects('A 10.9.11.21.6 12.10.12.17.6 14.8.8.20.6 B 10.9.13.15.11 7.7.9.20.11 13.7.11.-1.11', /shot B3/);
+  rejects('A 10.9.11.21.6 12.10.12.17.6 14.8.8.20.6 B 10.9.13.15.11 7.7.9.20.11 13.7.11.21.11 13.7.11.21.11', /more than 3 shots/);
+  rejects('A 10.9.11.21.6 12.10.12.17.6 14.8.8.20.6', /group B is missing/);
+  rejects('B 10.9.13.15.11 7.7.9.20.11 13.7.11.21.11', /group A is missing/);
+  rejects('10.9.11.21.6 A 10.9.11.21.6', /must start with A or B/);
+  rejects('A 1.1.1.1.1 1.1.1.1.1 1.1.1.1.1 A 1.1.1.1.1', /appears twice/);
+  rejects('', /empty/);
+  rejects('hello', /must start with A or B/);
+});
+t('B-before-A order is accepted', () => {
+  const r = P.parseDrillCode('B 10.9.13.15.11 7.7.9.20.11 13.7.11.21.11 A 10.9.11.21.6 12.10.12.17.6 14.8.8.20.6');
+  eq(String(r.ok), 'true'); eq(P.formatDrillCode(r.groups), DEFAULT_CODE);
+});
+
 // ---- other requests and parsers ----
 t('VerifyCode frames', () => {
   const raw = (kind, code) => P.rawFrame(0x20, [kind, code ? 1 : 0].concat(code ? Array.from(code, (c) => c.charCodeAt(0)) : [0, 0, 0, 0, 0, 0], [0]));

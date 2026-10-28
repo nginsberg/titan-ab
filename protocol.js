@@ -153,6 +153,47 @@
     return balls;
   }
 
+  // ---- drill codes: "A h.s.sp.ht.f h.s.sp.ht.f h.s.sp.ht.f B ..." (levels, 1-based) ----
+  function formatDrillCode(groups) {
+    var one = function (sh) { return FIELDS.map(function (f) { return sh[f]; }).join('.'); };
+    return 'A ' + groups.A.map(one).join(' ') + ' B ' + groups.B.map(one).join(' ');
+  }
+  // Strict: exactly 3 shots per group, whole numbers only, each inside its level range. Any problem rejects the whole
+  // code with an error naming the shot and field. Never clamps, never returns a partial result.
+  function parseDrillCode(text) {
+    var fail = function (msg) { return { ok: false, error: msg }; };
+    var toks = String(text == null ? '' : text).trim().split(/\s+/).filter(Boolean);
+    if (!toks.length) return fail('code is empty');
+    var groups = { A: [], B: [] }, seen = {}, cur = null;
+    for (var i = 0; i < toks.length; i++) {
+      var t = toks[i];
+      if (/^[ab]$/i.test(t)) {
+        cur = t.toUpperCase();
+        if (seen[cur]) return fail('group ' + cur + ' appears twice');
+        seen[cur] = true; continue;
+      }
+      if (!cur) return fail('code must start with A or B, found "' + t + '"');
+      var name = cur + (groups[cur].length + 1);
+      if (groups[cur].length >= 3) return fail('group ' + cur + ' has more than 3 shots (extra: "' + t + '")');
+      var parts = t.split('.');
+      if (parts.length !== FIELDS.length || !parts.every(function (p) { return /^\d+$/.test(p); }))
+        return fail('shot ' + name + ' "' + t + '" must be 5 whole numbers like horz.speed.spin.height.feed');
+      var shot = {};
+      for (var k = 0; k < FIELDS.length; k++) {
+        var f = FIELDS[k], v = parseInt(parts[k], 10), r = RANGES[f];
+        if (v < r[0] || v > r[1]) return fail('shot ' + name + ' ' + f + ' ' + v + ' is out of range ' + r[0] + '-' + r[1]);
+        shot[f] = v;
+      }
+      groups[cur].push(shot);
+    }
+    var gs = ['A', 'B'];
+    for (var g = 0; g < 2; g++) {
+      if (!seen[gs[g]]) return fail('group ' + gs[g] + ' is missing');
+      if (groups[gs[g]].length !== 3) return fail('group ' + gs[g] + ' has ' + groups[gs[g]].length + ' shots, need exactly 3');
+    }
+    return { ok: true, groups: groups };
+  }
+
   var requests = {
     getVersion: function () { return buildFrame(FUNC.VERSION, null); },
     getStatus: function () { return buildFrame(FUNC.STATUS, null); },
@@ -202,7 +243,7 @@
     FUNC: FUNC, CONTROL: CONTROL, STATUS_NAMES: STATUS_NAMES, RANGES: RANGES, FIELDS: FIELDS,
     crc16: crc16, rawFrame: rawFrame, escapeBytes: escapeBytes, buildFrame: buildFrame, chunk: chunk,
     FrameParser: FrameParser, label: label, clampShot: clampShot, shotBytes: shotBytes, ballBytes: ballBytes,
-    saveDrillPayload: saveDrillPayload, abBalls: abBalls, requests: requests, repeatSlots: repeatSlots,
+    saveDrillPayload: saveDrillPayload, formatDrillCode: formatDrillCode, parseDrillCode: parseDrillCode, abBalls: abBalls, requests: requests, repeatSlots: repeatSlots,
     parseVersion: parseVersion, parseVerify: parseVerify, parseStatus: parseStatus, hex: hex
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.TitanProtocol = api;
