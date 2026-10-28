@@ -369,7 +369,9 @@ def build_parser():
 
     f = sub.add_parser("fire", help="fire one ball: h.s.sp.ht.f")
     f.add_argument("shot")
-    f.add_argument("--via", choices=["drill", "balltest"], default="drill")
+    f.add_argument("--via", choices=["drill", "balltest"], default="drill",
+                   help="drill: SaveDrill + SetCurrentDrill + START, in the same automatic slot as 'drill' (the drill "
+                        "there is overwritten by this one-ball FIRE drill); balltest: BallTest + START, saves nothing")
     f.add_argument("--raw", action="store_true", help="ignore calibration")
     f.add_argument("--allow-fast", action="store_true", help="allow speed level above 14 (50 mph)")
 

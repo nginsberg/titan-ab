@@ -72,7 +72,7 @@ class Harness:
 
 @pytest.fixture
 def h():
-    # 22 stored drills: slot 23 (fire --via drill's scratch slot) is the next free one, as the machine requires
+    # 22 stored drills: slot 23 is the next free one, as the machine requires
     hh = Harness(drills=22)
     yield hh
     hh.close()
@@ -155,14 +155,37 @@ def test_full_machine_refused_unless_slot_is_ours(capsys):
         hh.close()
 
 
-def test_save_to_non_contiguous_slot_fails_the_sequence():
-    """The fake mirrors the machine: slot 23 on a 16-drill machine gets no reply and swallows the next frame."""
+def test_fire_via_drill_uses_next_free_slot_on_small_machine(capsys):
+    """Fewer than 22 drills: the old fixed slot 23 got no reply on the real machine; now the next free slot is used."""
     hh = Harness(drills=16)
     try:
         g = P.parse_drill_code(CODE)["groups"]
-        r = hh.call({"cmd": "fire", "shot": g["A"][0]})     # fire --via drill saves to scratch slot 23
-        assert not r["ok"] and "STOPPED at step 1" in r["error"] and "no reply" in r["error"]
-        assert hh.fake.drills == 16 and F["SET_CURRENT"] not in hh.fake.funcs()
+        r = hh.call({"cmd": "fire", "shot": g["A"][0]})
+        assert r["ok"], r
+        assert slot_of(hh) == 17 and hh.fake.drills == 17
+        assert hh.frames()[1] == (F["SET_CURRENT"], [17])
+        assert "machine holds 16 drills; using slot 17 (next free)" in "\n".join(r["lines"])
+        hh.clear()
+        assert hh.call({"cmd": "fire", "shot": g["A"][0]})["ok"]       # reused, the list does not grow
+        assert slot_of(hh) == 17 and hh.fake.drills == 17
+        assert hh.cli("drill", CODE) == 0                              # drill shares the remembered slot
+        assert slot_of(hh) == 17 and hh.fake.drills == 17
+    finally:
+        hh.close()
+
+
+def test_fire_via_drill_full_machine_refused_and_balltest_unaffected():
+    hh = Harness(drills=P.MAX_DRILLS)
+    try:
+        g = P.parse_drill_code(CODE)["groups"]
+        hh.clear()
+        r = hh.call({"cmd": "fire", "shot": g["A"][0]})
+        assert not r["ok"] and "none is ours to reuse" in r["error"] and hh.frames() == []
+        (hh.runs / "drill_slot.json").write_text(json.dumps({"slot": 20}))
+        assert hh.call({"cmd": "fire", "shot": g["A"][0]})["ok"] and slot_of(hh) == 20
+        hh.clear()
+        assert hh.call({"cmd": "fire", "shot": g["A"][0], "via": "balltest"})["ok"]
+        assert F["SAVE_DRILL"] not in hh.fake.funcs()
     finally:
         hh.close()
 

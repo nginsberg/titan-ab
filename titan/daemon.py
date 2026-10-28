@@ -31,7 +31,6 @@ STOP_REPLY_TIMEOUT = 1.2
 STOP_LOCK_WAIT = 1.2       # how long STOP waits for an in-flight chunk before writing directly
 STOP_ALARM_AFTER = 1.5
 SPEED_CAP = 14             # level 14 = 50 mph; above needs allow_fast
-FIRE_SLOT = 23
 F = P.FUNC
 START_SENT = "START was sent; the machine may be running. Press STOP if it is firing."
 
@@ -487,13 +486,20 @@ class Daemon:
         if err:
             return {"ok": False, "error": err}
         if via == "drill":
+            picked = await self._pick_slot()
+            if isinstance(picked, dict):
+                return picked
+            slot, why, n = picked
             ball = P.ball_bytes(False, 1, [shot])
             steps = [
-                ("SaveDrill slot %d (1 Regular ball)" % FIRE_SLOT, F["SAVE_DRILL"],
-                 P.save_drill(FIRE_SLOT, "FIRE", [ball]), SAVE_DRILL_TIMEOUT, False),
-                ("SetCurrentDrill [%d]" % FIRE_SLOT, F["SET_CURRENT"], P.set_current([FIRE_SLOT]), REPLY_TIMEOUT, False),
+                ("SaveDrill slot %d (1 Regular ball)" % slot, F["SAVE_DRILL"],
+                 P.save_drill(slot, "FIRE", [ball]), SAVE_DRILL_TIMEOUT, False),
+                ("SetCurrentDrill [%d]" % slot, F["SET_CURRENT"], P.set_current([slot]), REPLY_TIMEOUT, False),
                 ("Control START", F["CONTROL"], P.control("START"), REPLY_TIMEOUT, True),
             ]
+            r = await self.run_sequence(steps, on_ok=lambda f: self._save_slot(slot) if f == F["SAVE_DRILL"] else None)
+            r["lines"] = ["machine holds %d drills; using slot %d (%s)" % (n, slot, why)] + r.get("lines", [])
+            return r
         elif via == "balltest":
             steps = [
                 ("BallTest (Regular, loop 1)", F["BALL_TEST"], P.ball_test(False, 1, [shot]), REPLY_TIMEOUT, False),
@@ -526,17 +532,10 @@ class Daemon:
             raise NoReply("GetCrcList reply unusable (%d payload bytes)" % len(fr.payload))
         return len(fr.payload) // 2
 
-    async def drill(self, A, B, pairs=2, repeat=1, slot=None, allow_fast=False, out=None) -> dict:
+    async def _pick_slot(self, slot=None):
         """The machine only accepts SaveDrill for an existing slot or the next free one (it stores drills 1..N), so the
-        slot is chosen from GetCrcList: the slot we saved to before if it is <= N, else N+1. `slot` overrides (<= N+1)."""
-        if len(A) != 3 or len(B) != 3:
-            return {"ok": False, "error": "need exactly 3 shots in A and 3 in B"}
-        err = self._check_shots(list(A) + list(B) + ([out] if out else []), allow_fast)
-        if err:
-            return {"ok": False, "error": err}
-        for nm, v, lo, hi in (("pairs", pairs, 1, 8), ("repeat", repeat, 1, 99)):
-            if not isinstance(v, int) or isinstance(v, bool) or v < lo or v > hi:
-                return {"ok": False, "error": "%s must be %d-%d" % (nm, lo, hi)}
+        slot is chosen from GetCrcList: the slot we saved to before if it is <= N, else N+1. `slot` overrides (<= N+1).
+        Returns (slot, why, N), or an {"ok": False, "error": ...} dict."""
         if slot is not None and (not isinstance(slot, int) or isinstance(slot, bool) or not 1 <= slot <= P.MAX_DRILLS):
             return {"ok": False, "error": "slot must be 1-%d" % P.MAX_DRILLS}
         try:
@@ -558,6 +557,21 @@ class Daemon:
                     "delete one on the machine, or pick a slot with --slot" % (n, P.MAX_DRILLS)}
         else:
             slot, why = n + 1, "next free"
+        return slot, why, n
+
+    async def drill(self, A, B, pairs=2, repeat=1, slot=None, allow_fast=False, out=None) -> dict:
+        if len(A) != 3 or len(B) != 3:
+            return {"ok": False, "error": "need exactly 3 shots in A and 3 in B"}
+        err = self._check_shots(list(A) + list(B) + ([out] if out else []), allow_fast)
+        if err:
+            return {"ok": False, "error": err}
+        for nm, v, lo, hi in (("pairs", pairs, 1, 8), ("repeat", repeat, 1, 99)):
+            if not isinstance(v, int) or isinstance(v, bool) or v < lo or v > hi:
+                return {"ok": False, "error": "%s must be %d-%d" % (nm, lo, hi)}
+        picked = await self._pick_slot(slot)
+        if isinstance(picked, dict):
+            return picked
+        slot, why, n = picked
         frame = P.save_drill(slot, "AB RANDOM", P.ab_balls(A, B, pairs, out))
         steps = [
             ("SaveDrill slot %d (%d pairs)" % (slot, pairs), F["SAVE_DRILL"], frame, SAVE_DRILL_TIMEOUT, False),
