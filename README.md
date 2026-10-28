@@ -41,3 +41,33 @@ Not confirmed:
 - The PIN rule (resolved from `response/get_version_response.dart` and `pages/linking`): the mode letter in the version string maps P or Q to pickleball and D (or anything else) to tennis. The app sends the automatic VerifyCode only when that mode equals the app's own mode and the version reads major >= 7 and minor >= 4 (taken literally). This page behaves as the pickleball app, so the automatic check runs only for P or Q. The PIN box can always be used by hand. VerifyCode `kind` is 0 for the automatic check and 1 for a code typed by the user.
 - Whether the Titan advertises the Nordic UART service so the default device filter finds it (hence "Scan all devices").
 - Writes use "write with response" when the browser offers it. Bluefy's support for that was not checked.
+
+## Laptop workflow (Python daemon + CLI)
+The `titan/` package drives the machine from a MacBook. One process, the daemon, holds the Bluetooth link. Every other command is a thin client that talks to it over a unix socket (`runs/titan.sock`) and never touches Bluetooth. This split exists because only a Terminal.app process can get macOS Bluetooth permission; processes started by the assistant's shell crash on any CoreBluetooth use.
+
+### Owner: start the daemon
+Double-click `start-daemon.command` in Finder, or run `open -a Terminal start-daemon.command`. The first time, macOS asks to allow Terminal to use Bluetooth: allow it. Close the Titan phone app first so the machine is free.
+- With no saved address it scans for a device advertising the Nordic UART service (or with "titan" in its name). If it finds exactly one it connects and saves the address in `runs/device.json`; if it finds several it lists them (name, address, signal) and connects to none: restart with `./start-daemon.command --address <uuid>`. Once connected it only ever reconnects to that same machine. If the saved machine is not found it keeps retrying and does not scan for others; to switch machines use `--address` or delete `runs/device.json`.
+- On connect, if the machine already reports a running state, the window shows a loud MACHINE IS ALREADY RUNNING line.
+- If the machine asks for a PIN and none is saved or given, the window shows a loud PIN NEEDED line and the status line keeps saying PIN NEEDED. It never prompts, so the STOP key stays live. The assistant then runs `.venv/bin/python -m titan pin NNNNNN` with the digits on the machine's screen, or the owner restarts with `--pin NNNNNN`. An accepted PIN is saved in `runs/pin`.
+- In the daemon window Ctrl-Z and Ctrl-S are disabled so they cannot suspend or freeze the STOP key.
+- **That window is the emergency STOP.** SPACE, ENTER or `s` = STOP. `p` = PAUSE. `q` = STOP and quit. Ctrl-C, closing the window, or a crash also send STOP before disconnecting. Keep the window in front while the machine has balls in it.
+- If no STOP write gets through, the window shows a huge `STOP NOT SENT - USE MACHINE POWER BUTTON`. If the link drops it says so loudly and keeps reconnecting; the machine may still be running, so use its power button.
+- `--fake` runs a simulated machine with no Bluetooth (for trying the commands).
+
+### Assistant: commands
+Run from the project folder as `.venv/bin/python -m titan <command>`. Output is short plain text; a nonzero exit means it failed or was refused.
+- `status`: daemon up, connected, version, machine status, last command, calibration in effect. `log [-n 40] [--all]`: tail of `runs/session-YYYYMMDD.log` (every TX/RX frame in hex and every command; status polls hidden unless `--all`).
+- `stop`, `pause`, `start`. Note: `start` resumes whatever drill is current on the machine, with no speed check; it does not know what that drill contains. STOP skips the queue and cancels anything in progress, including a half-sent frame, so a START that has not gone out yet never goes out after it.
+- `fire h.s.sp.ht.f [--via drill|balltest] [--raw] [--allow-fast]`: one ball. `--via drill` (default) saves a one-ball drill (one Regular ball, loop 1) to scratch slot 23, sets it current and sends START. `--via balltest` sends BallTest (0x04) with the same ball, then START. Each step's reply is printed. Which path fires exactly one ball is still an on-court experiment.
+- `drill "A h.s.sp.ht.f x3 B h.s.sp.ht.f x3" [--pairs 2] [--repeat 10] [--slot 24] [--raw] [--allow-fast]`: same bytes as the web page's Start (Random ball from A, Random ball from B, `pairs` times, saved to the slot, then Set Current Drill with the slot repeated `repeat` times, then START). Codes are parsed strictly and never clamped.
+- `calib show | set [--horz-deg X] [--height-deg Y] | reset`: aim offsets in degrees (horz positive = further right, height positive = higher), stored in `runs/calibration.json`, applied to every `fire` and `drill` unless `--raw`. Each level is converted to degrees with the app's tables, the offset is added, and the nearest level is used; the before and after levels are printed. If the adjusted angle is outside what the machine can do, the command is refused.
+- Safety cap: any shot above speed level 14 (50 mph) is refused unless `--allow-fast`. The daemon checks this too.
+- Drill slots 23 (`fire --via drill`) and 24 (`drill` default) on the machine are overwritten every time; anything saved there before is lost.
+- A calibration file with a bad or non-finite value makes `fire` and `drill` refuse (unless `--raw`) until it is fixed or `calib reset`.
+- If a command gets no answer from the daemon, the sequence may still be running: check `status` or run `stop`.
+- `pin 123456`: send the machine PIN.
+
+Calibration loop on court: `fire` a shot, ask the owner where it landed, `calib set --horz-deg ... --height-deg ...`, fire again.
+
+Tests: `.venv/bin/python -m pytest -q -p no:cacheprovider tests/` (protocol vectors, a byte-for-byte cross-check against `protocol.js` via node, drill codes, calibration, and the daemon end to end with `--fake` over the socket, including STOP while a slow write is pending and STOP with every write hung).
